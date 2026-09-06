@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>daed-board</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f1420'/%3E%3Cpath d='M6 20 L12 12 L17 17 L26 8' stroke='%2338bdf8' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='26' cy='8' r='3' fill='%2334d399'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app" class="app" hidden>
+  <aside class="nav" id="nav">
+    <div class="nav-brand">
+      <svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#0f1420"/><path d="M6 20 L12 12 L17 17 L26 8" stroke="#38bdf8" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/><circle cx="26" cy="8" r="3" fill="#34d399"/></svg>
+      <div><b>daed-board</b><small id="nav-state">未连接</small></div>
+    </div>
+    <nav class="nav-list" id="nav-list"></nav>
+    <div class="nav-foot">
+      <a href="#" id="nav-daed-link" target="_blank" rel="noopener">官方面板 ↗</a>
+      <span id="nav-version"></span>
+    </div>
+  </aside>
+
+  <main class="main" id="main">
+    <div class="banner" id="banner" hidden></div>
+    <div id="page"></div>
+  </main>
+
+  <nav class="tabbar" id="tabbar"></nav>
+</div>
+
+<div class="login-mask" id="login" hidden>
+  <form class="login-card" id="login-form" autocomplete="off">
+    <div class="login-title">
+      <svg viewBox="0 0 32 32" width="34" height="34" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#0f1420"/><path d="M6 20 L12 12 L17 17 L26 8" stroke="#38bdf8" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/><circle cx="26" cy="8" r="3" fill="#34d399"/></svg>
+      <div><b>daed-board</b><small>zashboard 风格的 daed 仪表盘</small></div>
+    </div>
+      <label>后端地址<input id="login-url" type="url" placeholder="http://192.168.1.1:2023" spellcheck="false"></label>
+    <label>账号<input id="login-user" autocomplete="username" spellcheck="false"></label>
+    <label>密码<input id="login-pass" type="password" autocomplete="current-password"></label>
+    <label class="login-remember"><input id="login-remember" type="checkbox" checked> 记住密码（仅存本机浏览器）</label>
+    <button class="btn btn-primary btn-block" type="submit" id="login-btn">登 录</button>
+    <div class="login-err" id="login-err"></div>
+  </form>
+</div>
+
+<div class="modal-mask" id="modal" hidden>
+  <div class="modal-card">
+    <div id="modal-text"></div>
+    <div id="modal-fields" hidden></div>
+    <div class="form-row" style="justify-content:flex-end;margin-top:14px">
+      <button class="btn" id="modal-cancel">取消</button>
+      <button class="btn btn-primary" id="modal-ok">确定</button>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<noscript>需要启用 JavaScript。</noscript>
+<script src="app.js"></script>
+</body>
+</html>

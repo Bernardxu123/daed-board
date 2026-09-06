@@ -1,0 +1,10 @@
+{
+	"admin/services/daed-board": {
+		"title": "Daed 仪表盘",
+		"order": 21,
+		"action": {
+			"type": "view",
+			"path": "daed-board"
+		}
+	}
+}

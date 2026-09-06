@@ -1,0 +1,6 @@
+_deploy/
+.playwright-mcp/
+tools/
+*.png
+*.log
+cgi/*.log

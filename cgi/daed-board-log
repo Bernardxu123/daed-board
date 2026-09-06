@@ -1,0 +1,7 @@
+#!/bin/sh
+# daed-board 出口记录数据源：把 daed 连接日志尾部输出给前端解析。
+# 部署位置：/www/cgi-bin/daed-board-log（需可执行权限）。
+# 首行附带路由器内存可用量（#MEM kb），供概览页监控长期运行状态。
+printf 'Content-Type: text/plain; charset=utf-8\r\n\r\n'
+awk '/MemAvailable/{print "#MEM " $2; exit}' /proc/meminfo 2>/dev/null
+tail -n 600 /var/log/daed/daed.log 2>/dev/null
