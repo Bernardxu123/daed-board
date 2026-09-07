@@ -1180,7 +1180,10 @@ function renderNodesTable() {
     </tbody></table>`;
   if (keep.size) $$('#nd-table tbody input[type=checkbox]').forEach(i => { if (keep.has(i.value)) i.checked = true; });
   const chk = $('#nd-chkall');
-  if (chk) chk.checked = list.length > 0 && keep.size >= list.length;
+  if (chk) {
+    chk.checked = list.length > 0 && keep.size >= list.length;
+    chk.onchange = () => $$('#nd-table tbody input[type=checkbox]').forEach(i => { i.checked = chk.checked; });
+  }
 }
 
 /* ================= 页面：概览 ================= */
@@ -1428,6 +1431,14 @@ function pageNodes(el) {
   $('#nd-sub').addEventListener('change', e => { S.nodeSub = e.target.value; renderNodesTable(); });
   $('#nd-hide').addEventListener('change', e => { S.cfg.hideUnavail = e.target.checked; saveCfg(); renderNodesTable(); });
   $('#nd-junk').addEventListener('change', e => { S.cfg.showJunk = e.target.checked; saveCfg(); renderNodesTable(); });
+  // 一次性事件委托（表格随轮询重渲染，监听器必须挂在容器上）
+  $('#nd-table').addEventListener('change', e => {
+    if (e.target.id === 'nd-chkall') $$('#nd-table tbody input[type=checkbox]').forEach(i => { i.checked = e.target.checked; });
+  });
+  $('#nd-table').addEventListener('click', e => {
+    const p = e.target.closest('[data-lat]');
+    if (p) { e.stopPropagation(); testNodes([p.dataset.lat]); }
+  });
   $('#nd-testall').addEventListener('click', () => testNodes(visibleNodeIds()));
   $('#nd-testsel').addEventListener('click', () => {
     const ids = $$('#nd-table tbody input:checked').map(i => i.value);
