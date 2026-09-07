@@ -322,6 +322,7 @@ td.tag-cell { color: var(--muted); }
 }
 .pin-btn:hover { opacity: 1; transform: scale(1.2); }
 .pin-btn.on { opacity: 1; filter: drop-shadow(0 0 3px rgba(52, 211, 153, .8)); }
+.pin-btn.del-btn:hover { opacity: 1; transform: scale(1.2); filter: drop-shadow(0 0 3px rgba(248, 113, 113, .8)); }
 .node-card.pinned { border-color: rgba(52, 211, 153, .7); box-shadow: 0 0 0 1px rgba(52, 211, 153, .4); }
 .cfg-editor {
   width: 100%; min-height: 360px; background: var(--bg2); border: 1px solid var(--border);

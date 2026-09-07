@@ -864,8 +864,8 @@ function nodeCardHtml(g, n, rec, pred, st) {
   const isNow = rec && rec.nodeId === n.id;
   const isPred = pred && pred.node.id === n.id;
   const isPinned = st && st.mode === 'node' && (st.targetIds || []).includes(n.id);
-  return `<div class="node-card${isNow ? ' now' : ''}${isPred && !isNow ? ' predict' : ''}${isPinned ? ' pinned' : ''}${l && !l.alive ? ' dead' : ''}" data-node="${n.id}" title="点击测速｜📌 钉选为组内唯一节点（fixed）">
-    <div class="row1"><span class="nname">${esc(n.name)}</span>${n.protocol ? `<span class="proto">${esc(n.protocol)}</span>` : ''}<button class="pin-btn${isPinned ? ' on' : ''}" data-pin="${g.id}|${n.id}" title="${isPinned ? '当前钉选节点' : '钉选：组内仅保留此节点（fixed）'}">📌</button></div>
+  return `<div class="node-card${isNow ? ' now' : ''}${isPred && !isNow ? ' predict' : ''}${isPinned ? ' pinned' : ''}${l && !l.alive ? ' dead' : ''}" data-node="${n.id}" title="点击测速｜📌 钉选为组内唯一节点（fixed）｜🗑 删除节点">
+    <div class="row1"><span class="nname">${esc(n.name)}</span>${n.protocol ? `<span class="proto">${esc(n.protocol)}</span>` : ''}<button class="pin-btn${isPinned ? ' on' : ''}" data-pin="${g.id}|${n.id}" title="${isPinned ? '当前钉选节点' : '钉选：组内仅保留此节点（fixed）'}">📌</button><button class="pin-btn del-btn" data-del="${n.id}" title="从 daed 删除此节点（组内成员自动同步移除）">🗑</button></div>
     ${latPill(n.id)}
     ${l && !l.alive && l.message ? `<div class="node-msg" title="${esc(l.message)}">${esc(l.message)}</div>` : ''}
   </div>`;
@@ -1006,6 +1006,8 @@ function onGroupsClick(e) {
     if (g) testNodes(poolEff(g).map(n => n.id), g);
     return;
   }
+  const del = t.closest('[data-del]');
+  if (del) { delNodeAction(del.dataset.del); return; }
   const pill = t.closest('[data-lat]');
   if (pill) { testNodes([pill.dataset.lat]); return; }
   const card = t.closest('[data-node]');
@@ -1035,6 +1037,22 @@ async function testNodes(ids, group) {
     if (group) S.testingGroups.delete(group.id);
     renderGroups(); renderNodesTable();
   }
+}
+async function delNodeAction(nodeId) {
+  const n = S.nodesAll.find(x => x.id === nodeId) ||
+    S.groups.flatMap(g => (g.pool || g.nodes)).find(x => x.id === nodeId);
+  const name = n ? n.name : nodeId;
+  if (!(await showConfirm(
+    `确定从 daed 删除节点「<b>${esc(name)}</b>」？<br><span style="color:var(--yellow)">所在分组的成员会自动同步移除；订阅里的节点可能被订阅更新重新导入。</span>`))) return;
+  try {
+    await api.removeNodesBatch([nodeId]);
+    toast(`已删除「${name}」`, 'ok');
+  } catch (e) {
+    if (e instanceof AuthError) return handleAuthError();
+    toast('删除失败：' + e.message, 'err');
+  }
+  if (S.page === 'proxies') loadGroups();
+  else if (S.page === 'nodes') refreshNodesPage(false);
 }
 function renderNodesTable() {
   if (S.page !== 'nodes') return;
