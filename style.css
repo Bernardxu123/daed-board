@@ -299,6 +299,31 @@ td.tag-cell { color: var(--muted); }
   width: min(430px, 94vw); background: var(--card); border: 1px solid var(--border);
   border-radius: 14px; padding: 20px; font-size: 13.5px; line-height: 1.7; box-shadow: var(--shadow);
 }
+.modal-card.modal-wide { width: min(800px, 96vw); }
+.addnode-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.addnode-tab {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--muted); font-size: 12px; padding: 4px 10px; cursor: pointer;
+}
+.addnode-tab:hover { color: var(--text); }
+.addnode-tab.on { color: var(--text); border-color: rgba(56, 189, 248, .55); }
+.addnode-tab .cnt { color: var(--faint); font-size: 11px; }
+.addnode-pane.hide { display: none; }
+.addnode-ops { display: flex; gap: 8px; margin-bottom: 6px; }
+.addnode-mini {
+  background: transparent; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--muted); font-size: 11.5px; padding: 2px 8px; cursor: pointer;
+}
+.addnode-mini:hover { color: var(--text); border-color: #32405c; }
+.addnode-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 14px; max-height: 46vh; overflow: auto; padding-right: 4px; width: 100%; }
+#modal-fields label.addnode-item {
+  display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 5px;
+  font-size: 12px; color: var(--text); padding: 2.5px 0; cursor: pointer; min-width: 0; max-width: 100%;
+}
+.addnode-item input { flex: none; margin: 0; accent-color: var(--accent); background: transparent; border: 0; padding: 0; }
+.addnode-item .nn { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.addnode-item .pp { flex: none; color: var(--faint); font-size: 10.5px; font-family: var(--mono); white-space: nowrap; }
+.addnode-selinfo { margin-top: 8px; color: var(--muted); font-size: 12px; }
 #modal-fields { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
 #modal-fields label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12.5px; }
 #modal-fields .modal-input, #modal-fields textarea {

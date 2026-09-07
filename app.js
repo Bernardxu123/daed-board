@@ -361,9 +361,12 @@ let modalResolve = null;
 // showModal({title, fields}) → Promise<values|null>；showConfirm(html) → Promise<bool>
 function showModal(opts) {
   $('#modal-text').innerHTML = opts.title || '';
+  const card = document.querySelector('#modal .modal-card');
+  if (card) card.classList.toggle('modal-wide', !!opts.wide);
   const fb = $('#modal-fields');
   if (opts.fields && opts.fields.length) {
     fb.innerHTML = opts.fields.map(f => {
+      if (f.type === 'html') return f.html;
       if (f.type === 'textarea')
         return `<label>${esc(f.label)}<textarea class="modal-input" data-key="${esc(f.key)}" placeholder="${esc(f.placeholder || '')}">${esc(f.value || '')}</textarea>${f.hint ? `<span class="fhint">${esc(f.hint)}</span>` : ''}</label>`;
       if (f.type === 'select')
@@ -379,6 +382,8 @@ function showModal(opts) {
 }
 function showConfirm(html) { return showModal({ title: html }); }
 function closeModal(v) {
+  const card = document.querySelector('#modal .modal-card');
+  if (card) card.classList.remove('modal-wide');
   const fb = $('#modal-fields');
   let out = v;
   if (v && !fb.hidden) {
@@ -1066,8 +1071,46 @@ async function addNodesModal(g) {
   if (!cands.length) return toast('没有可添加的节点（全部已在该分组）', 'err');
   const ms = id => { const l = S.lat.get(id); return l && l.alive ? l.latencyMs + 'ms' : '—'; };
   const fixedNote = g.policy === 'fixed' ? '<span style="color:var(--yellow)">当前策略 fixed 只允许单节点，添加后应用时会自动切换为 min_avg10（想保留 fixed 单节点请用卡片上的 📌）。</span><br>' : '';
-  const fields = cands.map(n => ({ key: n.id, type: 'checkbox', label: `${n.name} · ${(n.protocol || '').toUpperCase()} · ${ms(n.id)}`, value: false }));
-  const out = await showModal({ title: `添加节点到分组「<b>${esc(g.name)}</b>」<br><span style="font-size:12px;color:var(--muted)">共 ${cands.length} 个可添加节点${fixedNote}</span>`, fields });
+  // 按订阅分组 → 标签页 + 双列网格
+  const bySub = new Map();
+  for (const n of cands) {
+    const k = n.subTag || '独立节点';
+    if (!bySub.has(k)) bySub.set(k, []);
+    bySub.get(k).push(n);
+  }
+  const tabs = [...bySub.keys()];
+  const item = n => `<label class="addnode-item" title="${esc(n.name)}"><input type="checkbox" class="modal-input" data-key="${esc(n.id)}"><span class="nn">${esc(n.name)}</span><span class="pp">${esc((n.protocol || '').toUpperCase())} ${ms(n.id)}</span></label>`;
+  const html = `
+    <div class="addnode-tabs">${tabs.map((t, i) => `<button type="button" class="addnode-tab${i === 0 ? ' on' : ''}" data-tab="${esc(t)}">${esc(t)} <span class="cnt">${bySub.get(t).length}</span></button>`).join('')}</div>
+    ${tabs.map((t, i) => `
+    <div class="addnode-pane${i === 0 ? '' : ' hide'}" data-pane="${esc(t)}">
+      <div class="addnode-ops"><button type="button" class="addnode-mini" data-selg="${esc(t)}">全选本组</button><button type="button" class="addnode-mini" data-deselg="${esc(t)}">清空本组</button></div>
+      <div class="addnode-grid">${bySub.get(t).map(item).join('')}</div>
+    </div>`).join('')}
+    <div class="addnode-selinfo">已选 <b id="addnode-count">0</b> / ${cands.length} 个</div>`;
+  const p = showModal({ title: `添加节点到分组「<b>${esc(g.name)}</b>」${fixedNote}`, wide: true, fields: [{ type: 'html', html }] });
+  const fb = $('#modal-fields');
+  const onCmd = e => {
+    const tabBtn = e.target.closest('[data-tab]');
+    if (tabBtn) {
+      $$('#modal-fields .addnode-tab').forEach(b => b.classList.toggle('on', b === tabBtn));
+      const k = tabBtn.dataset.tab;
+      $$('#modal-fields .addnode-pane').forEach(pane => pane.classList.toggle('hide', pane.dataset.pane !== k));
+      return;
+    }
+    const sel = e.target.closest('[data-selg]');
+    if (sel) { $$(`#modal-fields .addnode-pane[data-pane="${CSS.escape(sel.dataset.selg)}"] input[type=checkbox]`).forEach(c => { c.checked = true; }); onChg(); }
+    const desel = e.target.closest('[data-deselg]');
+    if (desel) { $$(`#modal-fields .addnode-pane[data-pane="${CSS.escape(desel.dataset.deselg)}"] input[type=checkbox]`).forEach(c => { c.checked = false; }); onChg(); }
+  };
+  const onChg = () => {
+    const el = document.getElementById('addnode-count');
+    if (el) el.textContent = String($$('#modal-fields input[type=checkbox]:checked').length);
+  };
+  fb.addEventListener('click', onCmd);
+  fb.addEventListener('change', onChg);
+  let out;
+  try { out = await p; } finally { fb.removeEventListener('click', onCmd); fb.removeEventListener('change', onChg); }
   if (!out) return;
   const ids = Object.keys(out).filter(k => out[k]);
   if (!ids.length) return toast('未勾选任何节点', 'err');
