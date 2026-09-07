@@ -452,7 +452,14 @@ async function steerRestore(g, silent) {
     const idx = await nodeIndex();
     const remap = idx.mk(st.backup);
     const origIds = dedupe((st.backup.explicitIds || []).map(remap).filter(Boolean));
-    if (!origIds.length) throw new Error('快照中的原始成员节点已全部不存在');
+    if (!origIds.length) {
+      // 退化快照（钉选前组内没有显式成员可恢复）：仅清除钉选状态，组结构保持现状
+      delete all[g.id];
+      await steerPersist(all);
+      await refreshGroups(false);
+      if (!silent) toast('已清除「' + g.name + '」的钉选状态（原快照无可恢复成员，组保持现有成员）', 'ok');
+      return true;
+    }
     await applyGroupShape(g, origIds);
     for (const s of st.backup.subs) {
       await api.addSubs(g.id, [s.id], s.nameFilterRegex);
@@ -895,6 +902,7 @@ function renderGroups() {
           <span>${visible.length}/${eff.length} 节点</span>
           <select class="policy-select" data-g="${g.id}" title="切换选点策略（重载后生效，代理连接瞬断 1-2 秒）">${policyOpts}</select>
           ${g.policy === 'fixed' ? `<button class="btn btn-sm" data-swap="${g.id}" title="更换 fixed 组的节点">✎ 换节点</button>` : ''}
+          <button class="btn icon" data-gadd="${g.id}" title="添加节点到此分组">＋</button>
           <button class="btn icon ${S.testingGroups.has(g.id) ? 'testing' : ''}" data-gtest="${g.id}" title="测试本组全部节点">⚡</button>
           <span class="chev">›</span>
         </div>
@@ -1008,6 +1016,8 @@ function onGroupsClick(e) {
   }
   const del = t.closest('[data-del]');
   if (del) { delNodeAction(del.dataset.del); return; }
+  const gadd = t.closest('[data-gadd]');
+  if (gadd) { addNodesModal(S.groups.find(x => x.id === gadd.dataset.gadd)); return; }
   const pill = t.closest('[data-lat]');
   if (pill) { testNodes([pill.dataset.lat]); return; }
   const card = t.closest('[data-node]');
@@ -1037,6 +1047,42 @@ async function testNodes(ids, group) {
     if (group) S.testingGroups.delete(group.id);
     renderGroups(); renderNodesTable();
   }
+}
+async function addNodesModal(g) {
+  if (!g) return;
+  const st = steerGet(g.id);
+  if (st && st.mode === 'region') return toast('该分组处于区域托管状态，请先切回「全局」再手动增删成员', 'err');
+  const inPool = new Set((g.pool || g.nodes).map(n => n.id));
+  let all = S.nodesAll;
+  if (!all || !all.length) {
+    const data = await api.nodesPage();
+    const byId = new Map();
+    for (const s of data.subscriptions || []) for (const n of (s.nodes && s.nodes.edges) || []) byId.set(n.id, { ...n, subTag: s.tag });
+    for (const n of (data.nodes && data.nodes.edges) || []) if (!byId.has(n.id)) byId.set(n.id, { ...n, subTag: '' });
+    all = [...byId.values()];
+    S.nodesAll = all;
+  }
+  const cands = all.filter(n => !inPool.has(n.id));
+  if (!cands.length) return toast('没有可添加的节点（全部已在该分组）', 'err');
+  const ms = id => { const l = S.lat.get(id); return l && l.alive ? l.latencyMs + 'ms' : '—'; };
+  const fixedNote = g.policy === 'fixed' ? '<span style="color:var(--yellow)">当前策略 fixed 只允许单节点，添加后应用时会自动切换为 min_avg10（想保留 fixed 单节点请用卡片上的 📌）。</span><br>' : '';
+  const fields = cands.map(n => ({ key: n.id, type: 'checkbox', label: `${n.name} · ${(n.protocol || '').toUpperCase()} · ${ms(n.id)}`, value: false }));
+  const out = await showModal({ title: `添加节点到分组「<b>${esc(g.name)}</b>」<br><span style="font-size:12px;color:var(--muted)">共 ${cands.length} 个可添加节点${fixedNote}</span>`, fields });
+  if (!out) return;
+  const ids = Object.keys(out).filter(k => out[k]);
+  if (!ids.length) return toast('未勾选任何节点', 'err');
+  const needPolicy = g.policy === 'fixed';
+  try {
+    if (st) { const all = steerLoadAll(); delete all[g.id]; await steerPersist(all); }
+    await api.addNodes(g.id, ids);
+    if (needPolicy) await api.setPolicy(g.id, 'min_avg10', []);
+    await api.run();
+    toast(`已添加 ${ids.length} 个节点到「${g.name}」${st ? '（已退出钉选）' : ''}${needPolicy ? '，fixed 多节点受限已自动切换 min_avg10' : ''}`, 'ok');
+  } catch (e) {
+    if (e instanceof AuthError) return handleAuthError();
+    toast('添加失败：' + e.message, 'err');
+  }
+  loadGroups();
 }
 async function delNodeAction(nodeId) {
   const n = S.nodesAll.find(x => x.id === nodeId) ||
