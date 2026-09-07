@@ -242,15 +242,15 @@ function parseLogLine(line) {
     ...kv,
   };
 }
+const logSeen = new Set(); // 常驻去重集合：避免每次 5s 轮询全量重建 1200 条的 Set
 function ingestLog(text) {
   const lines = text.split('\n').filter(Boolean);
   const entries = [];
   for (const ln of lines) { const e = parseLogLine(ln); if (e) entries.push(e); }
   entries.reverse(); // 文件为正序 → 倒序后最新在前
   const key = e => [e.ts, e.src, e.dst, e.network, e.ip, e.mac, e.outbound, e.dialer].join('|');
-  const seen = new Set(S.logEntries.map(key));
   const merged = [...S.logEntries];
-  for (const e of entries) { const k = key(e); if (!seen.has(k)) { seen.add(k); merged.push(e); } }
+  for (const e of entries) { const k = key(e); if (!logSeen.has(k)) { logSeen.add(k); merged.push(e); } }
   merged.sort((a, b) => b.ts - a.ts);
   S.logEntries = merged.slice(0, 1200);
   const rec = new Map();
@@ -1037,16 +1037,24 @@ function onGroupsClick(e) {
 }
 async function testNodes(ids, group) {
   if (!ids || !ids.length) return;
+  const CHUNK = 12; // 分片串行测速：避免 90+ 节点单个长 mutation 一失败全损
   ids.forEach(id => S.testing.add(id));
   if (group) S.testingGroups.add(group.id);
   renderGroups(); renderNodesTable();
+  let done = 0;
   try {
-    const res = await api.test(ids);
-    applyLatencies(res);
-    toast(`测速完成（${ids.length} 个节点）`, 'ok');
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const part = ids.slice(i, i + CHUNK);
+      if (ids.length > CHUNK) toast(`测速中 ${Math.min(i + CHUNK, ids.length)}/${ids.length}…`);
+      const res = await api.test(part);
+      applyLatencies(res);
+      done += part.length;
+      renderGroups(); renderNodesTable();
+    }
+    toast(`测速完成（${done} 个节点）`, 'ok');
   } catch (e) {
     if (e instanceof AuthError) return handleAuthError();
-    toast('测速失败：' + e.message, 'err');
+    toast(`测速失败：${e.message}（已完成 ${done}/${ids.length}）`, 'err');
   } finally {
     ids.forEach(id => S.testing.delete(id));
     if (group) S.testingGroups.delete(group.id);
@@ -1150,6 +1158,8 @@ function renderNodesTable() {
   if (!S.nodesAll.length) { box.innerHTML = '<div class="empty">无节点</div>'; return; }
   const list = S.nodesAll.filter(nodeTableVisible);
   const groupsOf = n => S.groups.filter(g => (g.pool || g.nodes).some(x => x.id === n.id)).map(g => g.name).join(', ');
+  // 轮询重渲染前后保持用户勾选（按节点 id 快照回填）
+  const keep = new Set($$('#nd-table tbody input[type=checkbox]:checked').map(i => i.value));
   box.innerHTML = `<table class="tbl"><thead><tr>
       <th style="width:26px"><input type="checkbox" id="nd-chkall"></th><th>节点</th><th>协议</th><th>标签</th><th>来源</th><th>所在分组</th><th>延迟</th><th>状态</th><th>测速时间</th>
     </tr></thead><tbody>
@@ -1168,9 +1178,9 @@ function renderNodesTable() {
       </tr>`;
     }).join('')}
     </tbody></table>`;
+  if (keep.size) $$('#nd-table tbody input[type=checkbox]').forEach(i => { if (keep.has(i.value)) i.checked = true; });
   const chk = $('#nd-chkall');
-  if (chk) chk.addEventListener('change', () => $$('#nd-table tbody input[type=checkbox]').forEach(i => i.checked = chk.checked));
-  box.querySelectorAll('[data-lat]').forEach(p => p.addEventListener('click', ev => { ev.stopPropagation(); testNodes([p.dataset.lat]); }));
+  if (chk) chk.checked = list.length > 0 && keep.size >= list.length;
 }
 
 /* ================= 页面：概览 ================= */
@@ -1330,6 +1340,12 @@ function pageLogs(el) {
   $('#lg-search').addEventListener('input', e => { S.logFilter = e.target.value.trim().toLowerCase(); renderLogPage(); });
   $('#lg-ob').addEventListener('change', e => { S.logOb = e.target.value; renderLogPage(); });
   $('#lg-refresh').addEventListener('click', () => refreshLog(true));
+  // 一次性委托：行点击复制原始日志（替代每次渲染重绑 400 个监听器）
+  $('#lg-table').addEventListener('click', e => {
+    const tr = e.target.closest('tr[data-raw]');
+    if (!tr || !navigator.clipboard) return;
+    navigator.clipboard.writeText(tr.dataset.raw).then(() => toast('已复制原始日志行', 'ok')).catch(() => {});
+  });
   refreshLog(false);
 }
 function shortSrc(src) { return String(src || '').replace(/\s*:\s+:/, ':'); }
@@ -1365,7 +1381,11 @@ function renderLogPage() {
   ).slice(0, 400);
   const cnt = $('#lg-count');
   if (cnt) cnt.textContent = `${rows.length} 条 / 共 ${S.logEntries.length}`;
-  if (!rows.length) { table.innerHTML = '<div class="empty">暂无匹配的连接记录（等待代理流量产生）</div>'; return; }
+  if (!rows.length) { table.innerHTML = '<div class="empty">暂无匹配的连接记录（等待代理流量产生）</div>'; S._logRenderKey = ''; return; }
+  // 内容无变化时跳过 400 行表格重建（出站卡片与计数仍会刷新"n 秒前"）
+  const rk = rows.length + '|' + (rows[0] ? rows[0].ts : '') + '|' + (rows[rows.length - 1] ? rows[rows.length - 1].ts : '') + '|' + (ob || '') + '|' + (f || '');
+  if (rk === S._logRenderKey && table.querySelector('table')) return;
+  S._logRenderKey = rk;
   table.innerHTML = `<table class="tbl"><thead><tr>
       <th>时间</th><th>网络</th><th>来源设备</th><th>目标</th><th>嗅探域名</th><th>出站</th><th>节点（实际）</th><th>策略</th><th>进程</th><th>MAC</th>
     </tr></thead><tbody>
@@ -1382,10 +1402,6 @@ function renderLogPage() {
       <td class="mono tag-cell">${esc(e.mac || '')}</td>
     </tr>`).join('')}
     </tbody></table>`;
-  table.querySelectorAll('tbody tr').forEach(tr => tr.addEventListener('click', () => {
-    navigator.clipboard && navigator.clipboard.writeText(tr.dataset.raw)
-      .then(() => toast('已复制原始日志行', 'ok')).catch(() => {});
-  }));
 }
 
 /* ================= 页面：节点订阅 ================= */
@@ -2247,12 +2263,12 @@ function updateNavState() {
 
 /* ================= 轮询 ================= */
 const POLL = [
-  { key: 'poll:groups', period: () => S.cfg.groupSec * 1000, pages: null, run: () => refreshGroups(false) },
+  { key: 'groups', period: () => S.cfg.groupSec * 1000, pages: null, run: () => refreshGroups(false) },
   { key: 'poll:general', period: () => 3000, pages: ['overview'], run: () => refreshGeneral() },
   { key: 'poll:log', period: () => S.cfg.logSec * 1000, pages: ['logs'], run: () => refreshLog(false) },
   { key: 'poll:logbg', period: () => Math.max(S.cfg.logSec, 10) * 1000, pages: null, run: () => { if (S.page !== 'logs') return refreshLog(false); } },
   { key: 'poll:nodes', period: () => 45000, pages: ['nodes'], run: () => refreshNodesPage(false) },
-  { key: 'poll:hist', period: () => 60000, pages: null, run: async () => {
+  { key: 'poll:hist', period: () => 180000, pages: null, run: async () => {
     if (!S.groups.length) return;
     const all = steerLoadAll();
     const extra = Object.values(all).flatMap(st => (st.backup && st.backup.pool || []).map(n => n.id));
