@@ -758,11 +758,31 @@ const PAGES = [
   { id: 'config', name: '配置', icon: 'config' },
   { id: 'settings', name: '设置', icon: 'settings' },
 ];
+const NAV_GROUPS = [
+  { label: '监控', ids: ['overview', 'proxies', 'logs'] },
+  { label: '管理', ids: ['nodes', 'config'] },
+  { label: '系统', ids: ['settings'] },
+];
+const PAGE_META = {
+  overview: { t: '概览', d: '核心状态、流量与内存一览 · 自动刷新' },
+  proxies: { t: '代理', d: '分组选点 · 实际出口来自连接日志 dialer 真值' },
+  logs: { t: '出口记录', d: '连接日志 · 点击行复制原始记录' },
+  nodes: { t: '节点订阅', d: '订阅管理与全量节点 · 支持导入/更新/删除' },
+  config: { t: '配置', d: '路由 / DNS 多版本与全局字段 · 改动需 run 生效' },
+  settings: { t: '设置', d: '连接 · 显示 · 场景预设 · 关于' },
+};
 
 /* ================= 路由 ================= */
+function navCounts(id) {
+  if (id === 'proxies') { const n = S.groups.reduce((a, g) => a + (g.pool || g.nodes || []).length, 0); return n ? String(n) : ''; }
+  if (id === 'nodes') return S.nodesAll.length ? String(S.nodesAll.length) : '';
+  return '';
+}
 function renderNav() {
-  const mk = p => `<div class="nav-item ${S.page === p.id ? 'on' : ''}" data-page="${p.id}" title="${p.name}">${ICONS[p.icon]}<span>${p.name}</span></div>`;
-  $('#nav-list').innerHTML = PAGES.map(mk).join('');
+  const mk = p => `<div class="nav-item ${S.page === p.id ? 'on' : ''}" data-page="${p.id}" title="${p.name}">${ICONS[p.icon]}<span>${p.name}</span>${navCounts(p.id) ? `<span class="cnt">${navCounts(p.id)}</span>` : ''}</div>`;
+  $('#nav-list').innerHTML = NAV_GROUPS.map(grp =>
+    `<div class="nav-group">${grp.label}</div>` + grp.ids.map(id => mk(PAGES.find(x => x.id === id))).join('')
+  ).join('');
   $('#tabbar').innerHTML = PAGES.map(mk).join('');
 }
 for (const host of ['#nav-list', '#tabbar']) {
@@ -772,10 +792,21 @@ for (const host of ['#nav-list', '#tabbar']) {
   });
 }
 window.addEventListener('hashchange', onRoute);
+// 通用 data-nav 跳转（概览卡/任务卡的页面直达按钮）
+document.addEventListener('click', e => {
+  const nav = e.target.closest('[data-nav]');
+  if (nav) { location.hash = '#/' + nav.dataset.nav; }
+});
 function onRoute() {
   const p = (location.hash || '#/proxies').replace(/^#\//, '') || 'proxies';
   S.page = PAGES.some(x => x.id === p) ? p : 'proxies';
   renderNav();
+  const meta = PAGE_META[S.page];
+  const tb = $('#tb-title'), td = $('#tb-desc');
+  if (tb) tb.textContent = meta.t;
+  if (td) td.textContent = meta.d;
+  document.title = meta.t + ' · daed-board';
+  topChips();
   renderPage();
 }
 function renderPage() {
@@ -784,11 +815,93 @@ function renderPage() {
   ({ proxies: pageProxies, overview: pageOverview, logs: pageLogs, nodes: pageNodes, config: pageConfig, settings: pageSettings })[S.page](el);
 }
 
+/* ================= 顶栏状态 chips ================= */
+function topChips() {
+  const box = $('#tb-chips');
+  if (!box) return;
+  const C = [];
+  const run = S.general && S.general.dae;
+  C.push(run ? `<span class="chip ${run.running ? 'ok' : 'warn'}"><span class="dot ${run.running ? 'on' : 'off'}"></span>核心${run.running ? '运行中' : '已停止'}</span>` : '');
+  if (run && run.modified) C.push(`<span class="chip warn">⚠ 有改动未应用</span>`);
+  else if (run) C.push(`<span class="chip ok">✓ 配置已应用</span>`);
+  if (S.cfgGlobal && S.cfgGlobal.global && S.cfgGlobal.global.logLevel) C.push(`<span class="chip mono">日志 <b>${esc(S.cfgGlobal.global.logLevel)}</b></span>`);
+  const d = new Date();
+  C.push(`<span class="chip mono">刷新 <b id="tick">${[d.getHours(), d.getMinutes(), d.getSeconds()].map(x => String(x).padStart(2, '0')).join(':')}</b></span>`);
+  box.innerHTML = C.join('');
+}
+setInterval(() => {
+  const t = $('#tick');
+  if (t) { const d = new Date(); t.textContent = [d.getHours(), d.getMinutes(), d.getSeconds()].map(x => String(x).padStart(2, '0')).join(':'); }
+}, 1000);
+
+/* ================= 通知中心（真数据） ================= */
+const NOTIF_KEY = 'db.notifs';
+function notifLoad() { try { const a = JSON.parse(localStorage.getItem(NOTIF_KEY) || '[]'); return Array.isArray(a) ? a.slice(0, 50) : []; } catch { return []; } }
+function notifSave(a) { try { localStorage.setItem(NOTIF_KEY, JSON.stringify(a.slice(0, 50))); } catch {} }
+function notifPush(lv, b, p) {
+  const arr = notifLoad();
+  const key = lv + '|' + b + '|' + p;
+  if (arr.some(x => x.key === key)) return;
+  const d = new Date();
+  arr.unshift({ key, lv, b, p, t: `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`, read: false });
+  notifSave(arr);
+  updateBell();
+}
+function notifUnread() { return notifLoad().filter(x => !x.read).length; }
+function updateBell() {
+  const bdg = $('#bell-bdg');
+  if (!bdg) return;
+  const n = notifUnread();
+  bdg.hidden = n === 0;
+  bdg.textContent = String(n);
+}
+function notifDerived() {
+  const run = S.general && S.general.dae;
+  if (run && run.modified) notifPush('warn', '配置有改动未应用', '点击顶栏「应用改动 (run)」重载生效（代理瞬断 1-2 秒）');
+  const dead = [];
+  for (const g of S.groups) for (const n of (g.pool || g.nodes || [])) {
+    const l = S.lat.get(n.id);
+    if (l && !l.alive && l.testedAt) dead.push(n.name + (l.message ? '（' + String(l.message).slice(0, 42) + '）' : ''));
+  }
+  if (dead.length) notifPush('err', `${dead.length} 个节点不可用`, dead.slice(0, 3).join('、') + (dead.length > 3 ? ' 等' : ''));
+  for (const s of S.subs || []) {
+    if (s.cronEnable && s.cronExp) notifPush('info', `订阅「${s.tag || s.id}」定时 ${s.cronExp}`, `节点 ${s.nodes && s.nodes.totalCount != null ? s.nodes.totalCount : '—'} 个`);
+  }
+}
+function openDrawer() {
+  const root = $('#drawer-root');
+  if (!root) return;
+  const arr = notifLoad();
+  root.innerHTML = `
+  <div class="drawer-mask" id="dw-mask"></div>
+  <aside class="drawer" role="dialog" aria-label="通知中心">
+    <div class="dh"><b>通知中心</b><span class="tag ${notifUnread() ? 'err' : ''}" id="dw-unread">${notifUnread()} 条未读</span><span class="spacer" style="flex:1"></span>
+      <button class="btn btn-sm" id="dw-read">全部已读</button><button class="icon-btn" id="dw-close" aria-label="关闭">✕</button></div>
+    <div class="db"><div class="notif">
+      ${arr.length ? arr.map(n => `
+        <div class="notif-item ${n.lv}">
+          ${!n.read ? '<span class="unread-dot" aria-hidden="true"></span>' : ''}
+          <div class="nt"><b>${esc(n.b)}</b><p>${esc(n.p)}</p></div><span class="ts">${esc(n.t)}</span>
+        </div>`).join('') : '<div class="empty">暂无通知</div>'}
+    </div></div>
+  </aside>`;
+  const close = () => { root.innerHTML = ''; };
+  $('#dw-mask').addEventListener('click', close);
+  $('#dw-close').addEventListener('click', close);
+  $('#dw-read').addEventListener('click', () => {
+    notifSave(notifLoad().map(x => ({ ...x, read: true })));
+    updateBell();
+    close();
+    toast('已全部标记为已读', 'ok');
+  });
+}
+
 /* ================= 页面：代理 ================= */
 function pageProxies(el) {
   el.innerHTML = `
-    <div class="ctrl">
-      <input class="search" id="px-search" placeholder="搜索节点 / 协议 / 标签…" value="${esc(S.filter)}">
+    <div class="toolbar">
+      <span class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input class="search" id="px-search" placeholder="搜索节点 / 协议 / 标签…" value="${esc(S.filter)}"></span>
       <select class="select" id="px-sort">
         <option value="default">默认排序</option>
         <option value="lat">延迟 ↑</option>
@@ -797,9 +910,9 @@ function pageProxies(el) {
       </select>
       <label class="check"><input type="checkbox" id="px-hide" ${S.cfg.hideUnavail ? 'checked' : ''}> 隐藏不可用</label>
       <label class="check"><input type="checkbox" id="px-junk" ${S.cfg.showJunk ? 'checked' : ''}> 显示无用节点</label>
-      <div class="spacer"></div>
-      <button class="btn" id="px-testall">⚡ 测速全部</button>
-      <button class="btn icon" id="px-refresh" title="刷新">⟳</button>
+      <span class="spacer"></span>
+      <button class="btn btn-sm" id="px-testall">⚡ 测速全部</button>
+      <button class="btn btn-sm" id="px-refresh" title="刷新">⟳ 刷新</button>
     </div>
     <div id="px-groups"><div class="empty">加载中…</div></div>`;
   $('#px-sort').value = S.cfg.sort;
@@ -858,6 +971,7 @@ async function refreshGroups(manual) {
     steerAudit().catch(() => {});
     if (S.page === 'logs') renderLogPage();
     updateNavState();
+    notifDerived();
     if (manual) toast('已刷新', 'ok');
   } catch (e) {
     if (e instanceof AuthError) return handleAuthError();
@@ -874,12 +988,14 @@ function nodeVisible(n) {
 function nodeCardHtml(g, n, rec, pred, st) {
   const l = S.lat.get(n.id);
   const isNow = rec && rec.nodeId === n.id;
-  const isPred = pred && pred.node.id === n.id;
   const isPinned = st && st.mode === 'node' && (st.targetIds || []).includes(n.id);
-  return `<div class="node-card${isNow ? ' now' : ''}${isPred && !isNow ? ' predict' : ''}${isPinned ? ' pinned' : ''}${l && !l.alive ? ' dead' : ''}" data-node="${n.id}" title="点击测速｜📌 钉选为组内唯一节点（fixed）｜🗑 删除节点">
-    <div class="row1"><span class="nname">${esc(n.name)}</span>${n.protocol ? `<span class="proto">${esc(n.protocol)}</span>` : ''}<button class="pin-btn${isPinned ? ' on' : ''}" data-pin="${g.id}|${n.id}" title="${isPinned ? '当前钉选节点' : '钉选：组内仅保留此节点（fixed）'}">📌</button><button class="pin-btn del-btn" data-del="${n.id}" title="从 daed 删除此节点（组内成员自动同步移除）">🗑</button></div>
-    ${latPill(n.id)}
-    ${l && !l.alive && l.message ? `<div class="node-msg" title="${esc(l.message)}">${esc(l.message)}</div>` : ''}
+  const latTxt = l && l.latencyMs != null ? l.latencyMs + 'ms' : (l && !l.alive ? '超时' : '—');
+  return `<div class="node-card${isNow ? ' now' : ''}${isPinned ? ' pinned' : ''}${l && !l.alive && l.testedAt ? ' dead' : ''}" data-node="${n.id}" title="点击测速｜📌 钉选为组内唯一节点（fixed）｜🗑 删除节点">
+    <div class="r1"><span class="nn" title="${esc(n.name)}">${esc(n.name)}</span><span class="proto">${esc(n.protocol || '')}</span>
+      <span class="nbtns"><button class="nbtn pin${isPinned ? ' on' : ''}" data-pin="${g.id}|${n.id}" title="${isPinned ? '当前钉选节点' : '钉选：组内仅保留此节点（fixed）'}" aria-label="钉选节点"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 3h6l1 7 2 3H6l2-3 1-7Z"/></svg></button><button class="nbtn" data-del="${n.id}" title="从 daed 删除此节点（组内成员自动同步移除）" aria-label="删除节点"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button></span></div>
+    <span class="lat ${latClass(l && l.latencyMs)}" data-lat="${n.id}" title="${isNow ? '当前实际出口 · ' : ''}点击重测${l && l.message ? '｜' + esc(l.message) : ''}">${latTxt}</span>
+    ${l && !l.alive && l.message ? `<div class="n-msg" title="${esc(l.message)}">${esc(l.message)}</div>` : ''}
+    ${isNow ? '<div class="hint" style="font-size:10.5px">● 当前实际出口</div>' : ''}
   </div>`;
 }
 function renderGroups() {
@@ -898,32 +1014,28 @@ function renderGroups() {
     const policyOpts = ['random', 'fixed', 'min', 'min_avg10', 'min_moving_avg']
       .map(p => `<option value="${p}" ${g.policy === p ? 'selected' : ''} ${p === 'fixed' && g.nodes.length > 1 ? 'disabled' : ''}>${p}${p === 'fixed' && g.nodes.length > 1 ? '（需单节点组）' : ''}</option>`).join('');
     const head = `
-      <div class="card-head" data-head="${g.id}">
-        <div class="group-title"><span class="name">${esc(g.name)}</span>
-          <span class="badge ${fixed ? 'fixed' : ''}">${fixed ? '🔒 fixed' : esc(g.policy)}</span>
-          ${st ? '<span class="badge-managed">面板托管</span>' : ''}
-        </div>
-        <div class="group-sub">
-          <span>${visible.length}/${eff.length} 节点</span>
-          <select class="policy-select" data-g="${g.id}" title="切换选点策略（重载后生效，代理连接瞬断 1-2 秒）">${policyOpts}</select>
-          ${g.policy === 'fixed' ? `<button class="btn btn-sm" data-swap="${g.id}" title="更换 fixed 组的节点">✎ 换节点</button>` : ''}
-          <button class="btn icon" data-gadd="${g.id}" title="添加节点到此分组">＋</button>
-          <button class="btn icon ${S.testingGroups.has(g.id) ? 'testing' : ''}" data-gtest="${g.id}" title="测试本组全部节点">⚡</button>
-          <span class="chev">›</span>
-        </div>
+      <div class="g-head" data-head="${g.id}">
+        <div class="gn"><span>${esc(g.name)}</span><span class="cnt">${visible.length}/${eff.length}</span></div>
+        <span class="tag ${fixed ? 'ok' : 'p'}">${fixed ? '🔒 fixed' : esc(g.policy)}</span>
+        ${st && st.mode === 'node' ? '<span class="tag ok">钉选 · ' + esc(st.pinnedName || '') + '</span>' : (st ? '<span class="tag ok">托管 · ' + esc(regionName(st.region)) + '</span>' : '')}
+        <span class="spacer"></span>
+        ${g.policy === 'fixed' ? `<button class="btn btn-sm" data-swap="${g.id}" title="更换 fixed 组的节点">✎ 换节点</button>` : ''}
+        <select class="policy-select" data-g="${g.id}" title="切换选点策略（重载后生效，代理连接瞬断 1-2 秒）">${policyOpts}</select>
+        <button class="btn btn-sm" data-gadd="${g.id}" title="添加节点到此分组">＋ 节点</button>
+        <button class="btn btn-sm ${S.testingGroups.has(g.id) ? 'btn-primary' : ''}" data-gtest="${g.id}" title="测试本组全部节点">⚡ 测速</button>
       </div>`;
-    let now;
+    let exitLine;
     if (fixed) {
-      now = `<div class="now-line">
-        <span class="item"><span class="dot-now"></span>固定出口：<span class="val" title="${esc(fixed.name)}">${esc(fixed.name)}</span></span>
-        ${rec ? `<span class="item">日志核实：<span class="val actual">${esc(rec.name)}</span><span class="hint">${ago(rec.ts)}</span></span>` : ''}
+      exitLine = `<div class="exit-line">
+        <span class="item"><span class="dot on"></span>固定出口 <span class="val" title="${esc(fixed.name)}">${esc(fixed.name)}</span></span>
+        ${rec ? `<span class="item">日志核实 <span class="val">${esc(rec.name)}</span><span class="hint">${ago(rec.ts)}</span></span>` : ''}
       </div>`;
     } else {
-      const managedLabel = st && st.mode === 'node' ? `托管 · 📌 ${esc(st.pinnedName || '')}` : (st ? `托管 · ${esc(regionName(st.region))}` : '');
-      now = `<div class="now-line">
-        ${st ? `<span class="badge-managed">${managedLabel}</span>` : ''}
-        <span class="item">预计出口：<span class="val" title="按面板自采样延迟均值近似 ${esc(g.policy)}，真值看右侧实际出口">${g.policy === 'random' ? '随机选点' : (pred ? esc(pred.node.name) : '—')}${pred && pred.samples < 3 ? ' ≈' : ''}</span></span>
-        <span class="item">实际出口：<span class="val actual" title="来自 daed 连接日志（真值）">${rec ? esc(rec.name) : '—'}</span>${rec ? `<span class="hint">${ago(rec.ts)}</span>` : ''}</span>
+      const managedLabel = st && st.mode === 'node' ? `钉选 · ${esc(st.pinnedName || '')}` : (st ? `托管 · ${esc(regionName(st.region))}` : '');
+      exitLine = `<div class="exit-line">
+        ${st ? `<span class="tag ok">${managedLabel}</span>` : ''}
+        <span class="item">实际出口 <span class="val" title="来自 daed 连接日志（真值）">${rec ? esc(rec.name) : '—'}</span>${rec ? `<span class="hint">${ago(rec.ts)}</span>` : ''}</span>
+        ${g.policy === 'random' ? '' : `<span class="pred">预计 ${pred ? esc(pred.node.name) : '—'}${pred && pred.samples < 3 ? ' ≈' : ''}</span>`}
       </div>`;
     }
     // 区域选择 chips：托管中显示快照全池的区域视图，未托管显示当前池
@@ -945,8 +1057,8 @@ function renderGroups() {
       };
       chips = '<div class="chip-row">' + mk('GL', srcNodes) + REGIONS.map(r => mk(r.id, byR.get(r.id) || [])).join('') + mk('OT', byR.get('OT') || []) + '</div>';
     }
-    // 区域分区
-    const dots = eff.map(n => {
+    // 节点池延迟分布预览（前 40）
+    const dots = eff.slice(0, 40).map(n => {
       const l = S.lat.get(n.id);
       const cls = l && l.latencyMs != null ? ' ' + latClass(l.latencyMs) : '';
       const isNow = rec && rec.nodeId === n.id;
@@ -959,14 +1071,15 @@ function renderGroups() {
       return `<div class="region-sec">
         <div class="region-head"><span class="rg-name">${esc(regionName(rid))}</span><span>${nodes.length} 节点</span>
           ${best != null ? `<span class="rg-best">最快 ${best}ms</span>` : ''}
-          <button class="btn icon" data-rgtest="${g.id}|${rid}" title="测速本区域全部节点">⚡</button>
+          <button class="btn btn-sm btn-ghost" data-rgtest="${g.id}|${rid}" title="测速本区域全部节点">⚡ 测速本区</button>
         </div>
         <div class="node-grid">${nodes.map(n => nodeCardHtml(g, n, rec, pred, st)).join('')}</div>
       </div>`;
     }).join('');
     const open = !S.closedGroups.has(g.id);
-    const body = open ? `<div class="now-wrap">${now}${chips}<div class="dots">${dots}</div>${sections}</div>` : '';
-    return `<div class="card group-card ${open ? 'open' : ''}" data-g="${g.id}">${head}${body}</div>`;
+    const body = open ? `${exitLine}${chips}<div class="dots">${dots}</div>${sections}
+      <div style="padding:0 16px 16px"><div class="node-card add-card" data-gadd="${g.id}" title="添加节点到此分组">＋ 添加节点</div></div>` : '';
+    return `<section class="card gcard" data-g="${g.id}">${head}${body}</section>`;
   }).join('');
 }
 function sortNodes(list) {
@@ -1197,8 +1310,11 @@ async function refreshGeneral() {
   try {
     S.general = await api.general();
     mergeSamples(S.general && S.general.runtimeOverview);
+    if (!S.cfgGlobal) { try { S.cfgGlobal = (await api.configsAll()).find(x => x.selected) || null; } catch {} }
+    if (!S.subs || !S.subs.length) { try { S.subs = (await api.nodesPage()).subscriptions || []; } catch {} }
     renderOverview();
     updateNavState();
+    notifDerived();
   } catch (e) {
     if (e instanceof AuthError) return handleAuthError();
   } finally { S.inflight.delete('general'); }
@@ -1221,88 +1337,194 @@ function renderOverview() {
   const tail = S.ovBuf.slice(-6);
   const upNow = tail.length ? tail.reduce((a, s) => a + s.up, 0) / tail.length : ov.uploadRate || 0;
   const downNow = tail.length ? tail.reduce((a, s) => a + s.down, 0) / tail.length : ov.downloadRate || 0;
+  const dlSpark = S.ovBuf.slice(-60).map(s => s.down);
+  const ulSpark = S.ovBuf.slice(-60).map(s => s.up);
+  const memSpark = memHistLoad().slice(-60).map(p => p.kb / 1024);
+  const memMB = S.memAvailKB ? Math.round(S.memAvailKB / 1024) : null;
+  let aliveN = 0, totalN = 0;
+  for (const gr of S.groups) for (const n of (gr.pool || gr.nodes || [])) { totalN++; const l = S.lat.get(n.id); if (l && l.alive) aliveN++; }
   const ifaces = (g.interfaces || []).filter(i => i.flag && i.flag.up && (i.ip || []).some(ip => !/^(fe80|127\.)/.test(ip)));
-  const ifaceChips = ifaces.map(i => {
-    const ips = (i.ip || []).filter(ip => !/^(fe80|127\.)/.test(ip));
-    return `<span class="iface-chip"><b>${esc(i.name)}</b><span class="ip">${ips.map(esc).join('<br>')}</span></span>`;
-  }).join('');
-  const exits = S.groups.map(gr => {
-    const rec = recentFor(gr);
-    const pred = predictFor(gr);
-    const fixed = gr.policy === 'fixed' ? fixedNodeFor(gr) : null;
-    return `<div class="g-exit-row"><span class="gname">${esc(gr.name)}</span>
-      <span class="badge ${fixed ? 'fixed' : ''}">${fixed ? '🔒 fixed' : esc(gr.policy)}</span>
-      ${steerGet(gr.id) ? '<span class="badge-managed">托管</span>' : ''}
-      <span>${fixed ? '🔒 ' + esc(fixed.name) : (rec ? `<b style="color:var(--green)">${esc(rec.name)}</b> <span class="hint">${ago(rec.ts)}</span>` : '—')}</span>
-      ${!fixed && pred && (!rec || rec.name !== pred.node.name) ? `<span class="hint">预计 ${esc(pred.node.name)}</span>` : ''}
-    </div>`;
-  }).join('');
+  const cfg = S.cfgGlobal && S.cfgGlobal.global ? S.cfgGlobal.global : {};
+  const notifs = notifLoad();
+  const guardTail = S.guardLog || [];
+
   box.innerHTML = `
-    <div class="ov-grid">
-      <div class="card ov-card c4">
-        <div class="ov-label">运行状态</div>
-        <div class="ov-row"><span class="status-dot ${g.dae.running ? 'on' : 'off'}"></span><span class="ov-big">${g.dae.running ? '运行中' : '已停止'}</span></div>
-        <div class="ov-row" style="margin-top:8px">
-          <span class="kv"><span class="hint">版本</span><b>${esc(g.dae.version || '')}</b></span>
-          ${g.dae.modified ? '<span class="badge" style="color:var(--yellow);border-color:rgba(251,191,36,.4)">配置有改动未应用</span>' : ''}
-        </div>
+  <div class="kpi-grid">
+    <div class="card kpi"><div class="lbl">下载速率</div>
+      <div class="val" style="color:var(--primary)">${fmtRate(downNow)}<small>↓</small></div>
+      <div class="ctx">累计 ↓${fmtBytes(ov.downloadTotal)}</div>
+      <div class="spark">${dlSpark.length >= 2 ? sparkline(dlSpark, 'var(--primary)') : ''}</div></div>
+    <div class="card kpi"><div class="lbl">上传速率</div>
+      <div class="val" style="color:var(--success)">${fmtRate(upNow)}<small>↑</small></div>
+      <div class="ctx">累计 ↑${fmtBytes(ov.uploadTotal)}</div>
+      <div class="spark">${ulSpark.length >= 2 ? sparkline(ulSpark, 'var(--success)') : ''}</div></div>
+    <div class="card kpi"><div class="lbl">活动连接</div>
+      <div class="val">${ov.activeConnections ?? '—'}<small>会话</small></div>
+      <div class="ctx">UDP ${ov.udpSessions ?? '—'} · 仅代理出站记录</div></div>
+    <div class="card kpi"><div class="lbl">内存可用</div>
+      <div class="val" style="color:${memMB != null && memMB < 180 ? 'var(--warning)' : ''}">${memMB ?? '—'}<small>MB</small></div>
+      <div class="ctx"><span class="warnt">阈值 180 / 红线 150</span></div>
+      <div class="spark">${memSpark.length >= 2 ? sparkline(memSpark, 'var(--warning)') : ''}</div></div>
+    <div class="card kpi"><div class="lbl">节点存活</div>
+      <div class="val">${aliveN}<small>/ ${totalN}</small></div>
+      <div class="ctx">${S.groups.length} 个分组 · min 策略自动择优</div></div>
+  </div>
+
+  <div class="ov-grid">
+    <section class="card span8">
+      <div class="card-head"><h2>实时速率</h2><span class="sub">来源 runtimeOverview 采样</span>
+        <span class="spacer"></span>
+        <span class="legend"><span class="lg-dl"><i></i>下载</span><span class="lg-ul"><i></i>上传</span></span></div>
+      <div class="chart-meta"><span class="big pdn">${fmtRate(downNow)}<i>下载</i></span><span class="big pub">${fmtRate(upNow)}<i>上传</i></span>
+        <span class="hint">更新于 ${hhmm(parseTime(ov.updatedAt)) || '—'}</span></div>
+      <div class="chart-wrap" id="ov-chart"></div>
+      <div class="chart-axis"><span>${S.ovBuf.length ? hhmm(S.ovBuf[Math.max(0, S.ovBuf.length - 120)].ts) : ''}</span><span>峰值 ${fmtRate(Math.max(0, ...S.ovBuf.slice(-120).map(s => Math.max(s.up, s.down))))}</span><span>${S.ovBuf.length ? hhmm(S.ovBuf[S.ovBuf.length - 1].ts) : ''}</span></div>
+    </section>
+
+    <section class="card span4">
+      <div class="card-head"><h2>系统状态</h2><span class="spacer"></span><button class="btn btn-sm btn-ghost" data-nav="config">配置 →</button></div>
+      <div class="state-list">
+        ${[
+          { k: '运行状态', v: g.dae.running ? '运行中' : '已停止', tag: g.dae.running ? 'ok' : 'err' },
+          { k: '核心版本', v: g.dae.version || '—' },
+          { k: '配置状态', v: g.dae.modified ? '有改动未应用' : '已生效', tag: g.dae.modified ? 'warn' : 'ok' },
+          { k: '拨号模式', v: cfg.dialMode || '—' },
+          { k: '日志级别', v: cfg.logLevel || '—' },
+          { k: '测速间隔', v: (cfg.checkInterval || '—') + ' / 容差 ' + (cfg.checkTolerance || '—') },
+          { k: '内存可用', v: memMB != null ? memMB + ' MB' : '—', tag: memMB != null && memMB < 180 ? 'warn' : 'ok' },
+        ].map(s => `<div class="state-row"><span class="k">${esc(s.k)}</span><span class="v" title="${esc(s.v)}">${esc(s.v)}</span>${s.tag ? `<span class="tag ${s.tag}">${s.tag === 'ok' ? '正常' : s.tag === 'warn' ? '注意' : '停止'}</span>` : ''}</div>`).join('')}
       </div>
-      <div class="card ov-card c4">
-        <div class="ov-label">活动连接</div>
-        <div class="ov-row"><span class="ov-big">${ov.activeConnections ?? '—'}</span><small style="color:var(--muted)">TCP/UDP 连接</small></div>
-        <div class="ov-row" style="margin-top:8px">
-          <span class="kv"><span class="hint">UDP 会话</span><b>${ov.udpSessions ?? '—'}</b></span>
-          <span class="kv"><span class="hint">内存可用</span><b>${S.memAvailKB ? (S.memAvailKB / 1024).toFixed(0) + ' MB' : '—'}</b></span>
-        </div>
-        <div class="ov-label" style="margin-top:10px">内存可用趋势（观察泄漏）</div>
-        <div id="mem-trend"></div>
+    </section>
+
+    <section class="card span8">
+      <div class="card-head"><h2>内存可用趋势</h2><span class="sub">观察 daed 泄漏 · 每 30min 采样 · 保留 8 天</span>
+        <span class="spacer"></span>
+        <span class="legend"><span class="lg-mem"><i></i>MemAvailable</span><span class="lg-warn"><i></i>阈值 180MB</span><span class="lg-red"><i></i>红线 150MB</span></span></div>
+      <div class="chart-wrap" id="mem-chart"></div>
+      <div class="chart-axis"><span>${memTrendRange().t0}</span><span>守卫：连续 2 天 &lt;180MB 才重启</span><span>${memTrendRange().t1}</span></div>
+    </section>
+
+    <section class="card span4">
+      <div class="card-head"><h2>通知中心</h2><span class="tag ${notifUnread() ? 'err' : ''}">${notifUnread()} 条未读</span><span class="spacer"></span>
+        <button class="btn btn-sm btn-ghost" id="ov-openbell">全部</button><button class="btn btn-sm btn-ghost" id="ov-markread">全部已读</button></div>
+      <div class="notif">
+        ${notifs.length ? notifs.slice(0, 6).map(n => `
+        <div class="notif-item ${n.lv}">
+          ${!n.read ? '<span class="unread-dot" aria-hidden="true"></span>' : ''}
+          <div class="nt"><b>${esc(n.b)}</b><p>${esc(n.p)}</p></div><span class="ts">${esc(n.t)}</span>
+        </div>`).join('') : '<div class="empty">暂无通知</div>'}
       </div>
-      <div class="card ov-card c4">
-        <div class="ov-label">累计流量（本次运行）</div>
-        <div class="ov-row"><span class="kv"><span class="hint">↑</span><b>${fmtBytes(ov.uploadTotal)}</b></span><span class="kv"><span class="hint">↓</span><b>${fmtBytes(ov.downloadTotal)}</b></span></div>
-        <div class="ov-row" style="margin-top:8px"><span class="kv"><span class="hint">更新</span><b>${hhmm(parseTime(ov.updatedAt))}</b></span></div>
+    </section>
+
+    <section class="card span8">
+      <div class="card-head"><h2>定时任务与后台操作</h2><span class="sub">订阅 cron · 内存守卫 · 场景预设</span></div>
+      ${[
+        ...(S.subs || []).map(s => ({ st: s.cronEnable ? 'run' : 'idle', icon: s.cronEnable ? '⟳' : '◦', name: `订阅「${s.tag || s.id}」`, tags: [s.cronEnable ? `cron ${s.cronExp}` : '手动'], m: `节点 ${s.nodes && s.nodes.totalCount != null ? s.nodes.totalCount : '—'} 个 · 上次更新 ${ago(parseTime(s.updatedAt)) || '—'}`, acts: [] })),
+        { st: guardTail.length && /restart/.test(guardTail[0]) ? 'warn' : 'ok', icon: '🛡', name: '内存守卫 daed-guard', tags: ['阈值 180MB', '连续 2 天确认'], m: guardTail.length ? guardTail[0] : '每日 04:30 检查 · 暂无记录', acts: [] },
+        { st: 'idle', icon: '⚡', name: '场景预设', tags: ['日常模式'], m: '设置页一键切换托管/策略/日志组合', acts: [{ n: '去设置', nav: 'settings' }] },
+      ].map(t => `
+      <div class="task">
+        <span class="st ${t.st}" aria-hidden="true">${t.icon}</span>
+        <div class="ti"><b>${esc(t.name)} ${t.tags.map(x => `<span class="tag ${x.includes('阈值') || x.includes('cron') ? 'p' : ''}">${esc(x)}</span>`).join('')}</b>
+          <div class="m">${esc(t.m)}</div></div>
+        <div class="ta">${t.acts.map(a => `<button class="btn btn-sm" data-nav="${a.nav}">${esc(a.n)}</button>`).join('')}</div>
+      </div>`).join('')}
+    </section>
+
+    <section class="card span4">
+      <div class="card-head"><h2>分组实际出口</h2><span class="spacer"></span><button class="btn btn-sm btn-ghost" data-nav="logs">出口记录 →</button></div>
+      <div class="card-pad" style="display:flex;flex-direction:column;gap:12px">
+        ${S.groups.map(gr => {
+          const rec = recentFor(gr);
+          const pred = predictFor(gr);
+          const fixed = gr.policy === 'fixed' ? fixedNodeFor(gr) : null;
+          const st = steerGet(gr.id);
+          return `<div>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+            <b style="font-size:13px">${esc(gr.name)}</b>
+            <span class="tag p">${esc(gr.policy)}</span>
+            ${st ? '<span class="tag ok">托管</span>' : ''}
+            <span class="hint" style="margin-left:auto">${(gr.pool || gr.nodes || []).length} 节点</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;font-size:12.5px">
+            <span class="dot on"></span><span style="color:var(--success);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${fixed ? '🔒 ' + esc(fixed.name) : (rec ? esc(rec.name) : '—')}</span>
+            <span class="hint" style="margin-left:auto">${rec ? ago(rec.ts) : ''}</span>
+          </div>
+          ${!fixed && pred ? `<div class="hint">预计出口 ${esc(pred.node.name)}（按延迟均值近似）</div>` : ''}
+        </div>`;
+        }).join('')}
+        <div class="hint" style="border-top:1px solid var(--border);padding-top:10px">真值来自连接日志 dialer 字段；直连/拦截流量不产生日志。</div>
       </div>
-      <div class="card ov-card c8">
-        <div class="ov-label">实时速率</div>
-        <div class="ov-row" style="margin-bottom:8px">
-          <span class="ov-big" style="color:var(--accent)">${fmtRate(downNow)}</span><small style="color:var(--muted)">下载</small>
-          <span class="ov-big" style="color:var(--green);margin-left:18px">${fmtRate(upNow)}</span><small style="color:var(--muted)">上传</small>
-        </div>
-        <div class="chart-wrap" id="ov-chart"></div>
-        <div class="legend"><span><i style="background:#60a5fa"></i>下载</span><span><i style="background:#34d399"></i>上传</span></div>
-      </div>
-      <div class="card ov-card c4">
-        <div class="ov-label">分组实际出口</div>
-        ${exits || '<div class="hint">暂无日志数据</div>'}
-      </div>
-      <div class="card ov-card c12">
-        <div class="ov-label">接口（在线且有全局地址）</div>
-        <div class="iface">${ifaceChips || '<span class="hint">无</span>'}</div>
-      </div>
-    </div>`;
-  drawChart($('#ov-chart'));
-  drawMemTrend($('#mem-trend'));
+    </section>
+  </div>`;
+  rateChartInto($('#ov-chart'));
+  memChartInto($('#mem-chart'));
+  const open = $('#ov-openbell');
+  if (open) open.addEventListener('click', openDrawer);
+  const mark = $('#ov-markread');
+  if (mark) mark.addEventListener('click', () => { notifSave(notifLoad().map(x => ({ ...x, read: true }))); updateBell(); renderOverview(); toast('已全部标记为已读', 'ok'); });
 }
-function drawChart(box) {
+
+/* ================= SVG 图表生成器 ================= */
+function sparkline(vals, color, w = 120, h = 30) {
+  if (!vals || vals.length < 2) return '';
+  const max = Math.max(...vals), min = Math.min(...vals);
+  const X = i => i / (vals.length - 1) * w;
+  const Y = v => h - (v - min) / (max - min || 1) * (h - 4) - 2;
+  const d = vals.map((v, i) => `${i ? 'L' : 'M'}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join('');
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">
+    <path d="${d}L${w},${h}L0,${h}Z" fill="${color}" opacity=".12"/>
+    <path d="${d}" fill="none" stroke="${color}" stroke-width="1.4" vector-effect="non-scaling-stroke" opacity=".85"/></svg>`;
+}
+function memTrendRange() {
+  const arr = memHistLoad();
+  if (!arr.length) return { t0: '—', t1: '—' };
+  const f = t => new Date(t).toLocaleDateString().slice(5);
+  return { t0: f(arr[0].t), t1: f(arr[arr.length - 1].t) };
+}
+function rateChartInto(box) {
   if (!box) return;
-  const buf = S.ovBuf.slice(-720);
-  if (buf.length < 2) { box.innerHTML = '<div class="hint">采样中…</div>'; return; }
-  const W = 600, H = 150, pad = 4;
+  const buf = S.ovBuf.slice(-120);
+  if (buf.length < 2) { box.innerHTML = '<div class="hint" style="padding:16px">速率采样中…（runtimeOverview 每 3 秒回流一个点）</div>'; return; }
+  const W = 600, H = 168, pad = 6;
   const maxV = Math.max(1, ...buf.map(s => Math.max(s.up, s.down))) * 1.15;
-  const t0 = buf[0].ts, t1 = buf[buf.length - 1].ts, span = Math.max(1, t1 - t0);
-  const X = ts => pad + (ts - t0) / span * (W - pad * 2);
+  const X = i => pad + i / (buf.length - 1) * (W - pad * 2);
   const Y = v => H - pad - v / maxV * (H - pad * 2);
-  const path = key => buf.map((s, i) => `${i ? 'L' : 'M'}${X(s.ts).toFixed(1)},${Y(s[key]).toFixed(1)}`).join('');
-  const area = key => `${path(key)}L${X(t1).toFixed(1)},${H - pad}L${X(t0).toFixed(1)},${H - pad}Z`;
-  const grid = [0.25, 0.5, 0.75].map(f => `<line x1="0" x2="${W}" y1="${(H * f).toFixed(0)}" y2="${(H * f).toFixed(0)}" stroke="rgba(139,148,167,.12)" stroke-width="1"/>`).join('');
-  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
-    ${grid}
-    <path d="${area('down')}" fill="rgba(96,165,250,.12)"/>
-    <path d="${path('down')}" fill="none" stroke="#60a5fa" stroke-width="1.6" vector-effect="non-scaling-stroke"/>
-    <path d="${area('up')}" fill="rgba(52,211,153,.10)"/>
-    <path d="${path('up')}" fill="none" stroke="#34d399" stroke-width="1.4" vector-effect="non-scaling-stroke"/>
-  </svg>
-  <div class="hint" style="display:flex;justify-content:space-between"><span>${hhmm(t0)}</span><span>峰值 ${fmtRate(Math.max(...buf.map(s => Math.max(s.up, s.down))))}</span><span>${hhmm(t1)}</span></div>`;
+  const path = key => buf.map((s, i) => `${i ? 'L' : 'M'}${X(i).toFixed(1)},${Y(s[key]).toFixed(1)}`).join('');
+  const area = key => `${path(key)}L${X(buf.length - 1).toFixed(1)},${H - pad}L${X(0).toFixed(1)},${H - pad}Z`;
+  const grid = [0.25, 0.5, 0.75].map(f => `<line x1="0" x2="${W}" y1="${(H * f) | 0}" y2="${(H * f) | 0}" stroke="var(--border)" stroke-width="1"/>`).join('');
+  const yLab = [0, 0.5, 1].map(f => `<text x="${pad}" y="${(H - pad - f * (H - pad * 2)) - 3}" font-size="9" fill="var(--text-3)" font-family="var(--mono)">${fmtRate(maxV * f)}</text>`).join('');
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="近 20 分钟下载与上传速率">
+    ${grid}${yLab}
+    <path d="${area('down')}" fill="var(--primary)" opacity=".10"/>
+    <path d="${path('down')}" fill="none" stroke="var(--primary)" stroke-width="var(--seed-chart-weight)" vector-effect="non-scaling-stroke"/>
+    <path d="${area('up')}" fill="var(--success)" opacity=".08"/>
+    <path d="${path('up')}" fill="none" stroke="var(--success)" stroke-width="calc(var(--seed-chart-weight) * .85)" vector-effect="non-scaling-stroke"/>
+  </svg>`;
+}
+function memChartInto(box) {
+  if (!box) return;
+  const arr = memHistLoad().filter(p => p.kb > 0);
+  if (arr.length < 3) { box.innerHTML = '<div class="hint" style="padding:16px">内存趋势采样中（每 30 分钟一个点，1 天后出曲线）…</div>'; return; }
+  const W = 600, H = 168, pad = 6;
+  const max = Math.max(320 * 1024, ...arr.map(p => p.kb)) * 1.05, min = Math.min(120 * 1024, ...arr.map(p => p.kb)) * 0.92;
+  const X = i => pad + i / (arr.length - 1) * (W - pad * 2);
+  const Y = v => H - pad - (v - min) / (max - min) * (H - pad * 2);
+  const d = arr.map((p, i) => `${i ? 'L' : 'M'}${X(i).toFixed(1)},${Y(p.kb).toFixed(1)}`).join('');
+  const redY = Y(150 * 1024).toFixed(1), warnY = Y(180 * 1024).toFixed(1);
+  const mb = v => (v / 1024).toFixed(0);
+  const dipIdx = arr.findIndex(p => p.kb < 180 * 1024);
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="内存可用趋势，阈值 180MB，红线 150MB">
+    <line x1="0" x2="${W}" y1="${redY}" y2="${redY}" stroke="var(--danger)" stroke-width="1" stroke-dasharray="4 4" opacity=".8"/>
+    <line x1="0" x2="${W}" y1="${warnY}" y2="${warnY}" stroke="var(--warning)" stroke-width="1" stroke-dasharray="4 4" opacity=".45"/>
+    <text x="${W - 4}" y="${redY - 4}" text-anchor="end" font-size="9" fill="var(--danger)" font-family="var(--mono)">红线 150MB</text>
+    <text x="${W - 4}" y="${warnY - 4}" text-anchor="end" font-size="9" fill="var(--warning)" font-family="var(--mono)">阈值 180MB</text>
+    <path d="${d}" fill="none" stroke="var(--primary)" stroke-width="var(--seed-chart-weight)" vector-effect="non-scaling-stroke"/>
+    ${dipIdx >= 0 ? `<circle cx="${X(dipIdx).toFixed(1)}" cy="${Y(arr[dipIdx].kb).toFixed(1)}" r="3.5" fill="var(--warning)" stroke="var(--surface)" stroke-width="1.5"/>
+    <text x="${(X(dipIdx) + 7).toFixed(1)}" y="${(Y(arr[dipIdx].kb) + 3).toFixed(1)}" font-size="9" fill="var(--warning)" font-family="var(--mono)">${mb(arr[dipIdx].kb)}MB · 守卫第一次确认</text>` : ''}
+    ${[0, Math.floor((arr.length - 1) / 2), arr.length - 1].map(i => `<text x="${X(i).toFixed(1)}" y="${H - 2}" font-size="9" fill="var(--text-3)" font-family="var(--mono)">${new Date(arr[i].t).toLocaleDateString().slice(5)}</text>`).join('')}
+    <text x="${pad}" y="14" font-size="9" fill="var(--text-3)" font-family="var(--mono)">MB</text>
+  </svg>`;
 }
 
 /* ================= 页面：出口记录 ================= */
@@ -1317,9 +1539,17 @@ async function refreshLog(manual) {
   try {
     const r = await fetchTimeout(cgiUrl(), {}, 10000);
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    const text = await r.text();
+    let text = await r.text();
     const mem = /^#MEM\s+(\d+)/m.exec(text);
     if (mem) { S.memAvailKB = +mem[1]; memHistSample(); }
+    // 守卫事件 → 通知中心（去重后推送）
+    const gLines = text.split(String.fromCharCode(10)).filter(l => l.startsWith('#GUARD ')).map(l => l.slice(7).trim());
+    if (gLines.length !== (S.guardLog || []).length || gLines.some((l, i2) => l !== (S.guardLog || [])[i2])) {
+      const known = new Set(S.guardLog || []);
+      for (const gl of gLines) if (!known.has(gl)) notifPush(/restart/.test(gl) ? 'warn' : 'info', '内存守卫 daed-guard', gl);
+      S.guardLog = gLines;
+    }
+    text = text.replace(/^#GUARD .*$/mg, '');
     ingestLog(text);
     renderLogPage();
     if (S.page === 'proxies') renderGroups();      // 实际出口即刻反映
@@ -1330,16 +1560,17 @@ async function refreshLog(manual) {
 }
 function pageLogs(el) {
   el.innerHTML = `
-    <div class="ctrl">
-      <input class="search" id="lg-search" placeholder="筛选：域名 / IP / MAC / 节点…" value="${esc(S.logFilter)}">
+    <div class="toolbar">
+      <span class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input class="search" id="lg-search" placeholder="筛选：域名 / IP / MAC / 节点…" value="${esc(S.logFilter)}"></span>
       <select class="select" id="lg-ob"><option value="">全部出站</option></select>
-      <div class="spacer"></div>
+      <span class="spacer"></span>
       <span class="hint" id="lg-count"></span>
-      <button class="btn icon" id="lg-refresh" title="刷新">⟳</button>
+      <button class="btn btn-sm" id="lg-refresh">⟳ 刷新</button>
     </div>
     <div class="exit-cards" id="lg-exits"></div>
     <div class="card"><div class="table-wrap" id="lg-table"><div class="empty">加载中…</div></div></div>
-    <div class="hint" style="margin-top:10px">说明：仅代理出站流量会产生连接日志（直连/拦截不记录）；展示 daed.log 最近连接的 实际出口节点（dialer）。</div>`;
+    <p class="hint" style="margin-top:10px">说明：仅代理出站流量会产生连接日志（直连/拦截不记录）；dialer 字段为每条连接真实选点真值。日志级别需 ≥ info。</p>`;
   $('#lg-search').addEventListener('input', e => { S.logFilter = e.target.value.trim().toLowerCase(); renderLogPage(); });
   $('#lg-ob').addEventListener('change', e => { S.logOb = e.target.value; renderLogPage(); });
   $('#lg-refresh').addEventListener('click', () => refreshLog(true));
@@ -1410,22 +1641,23 @@ function renderLogPage() {
 /* ================= 页面：节点订阅 ================= */
 function pageNodes(el) {
   el.innerHTML = `
-    <div class="ctrl">
-      <input class="search" id="nd-search" placeholder="搜索节点…" value="${esc(S.nodeFilter)}">
+    <div class="toolbar">
+      <span class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input class="search" id="nd-search" placeholder="搜索节点…" value="${esc(S.nodeFilter)}"></span>
       <select class="select" id="nd-sub"><option value="">全部订阅</option></select>
       <label class="check"><input type="checkbox" id="nd-hide" ${S.cfg.hideUnavail ? 'checked' : ''}> 隐藏不可用</label>
       <label class="check"><input type="checkbox" id="nd-junk" ${S.cfg.showJunk ? 'checked' : ''}> 显示无用节点</label>
-      <div class="spacer"></div>
-      <button class="btn btn-primary" id="nd-addsub">＋ 导入订阅</button>
-      <button class="btn" id="nd-addnodes">＋ 批量导入节点</button>
-      <button class="btn btn-danger" id="nd-delnodes">删除选中</button>
-      <button class="btn" id="nd-testsel">⚡ 测速选中</button>
-      <button class="btn" id="nd-testall">⚡ 测速全部</button>
-      <button class="btn icon" id="nd-refresh" title="刷新">⟳</button>
+      <span class="spacer"></span>
+      <button class="btn btn-primary btn-sm" id="nd-addsub">＋ 导入订阅</button>
+      <button class="btn btn-sm" id="nd-addnodes">＋ 批量导入节点</button>
+      <button class="btn btn-sm" id="nd-testsel">⚡ 测速选中</button>
+      <button class="btn btn-danger btn-sm" id="nd-delnodes">删除选中</button>
+      <button class="btn btn-sm" id="nd-testall">⚡ 测速全部</button>
+      <button class="btn btn-sm" id="nd-refresh" title="刷新">⟳ 刷新</button>
     </div>
-    <div class="section-title">订阅</div>
+    <div class="section-title">订阅源</div>
     <div class="sub-grid" id="nd-subs"><div class="empty">加载中…</div></div>
-    <div class="section-title">节点</div>
+    <div class="section-title">全量节点</div>
     <div class="card"><div class="table-wrap" id="nd-table"><div class="empty">加载中…</div></div></div>`;
   $('#nd-search').addEventListener('input', e => { S.nodeFilter = e.target.value.trim().toLowerCase(); renderNodesTable(); });
   $('#nd-sub').addEventListener('change', e => { S.nodeSub = e.target.value; renderNodesTable(); });
@@ -1489,12 +1721,10 @@ function renderSubs() {
       `<option value="${esc(s.id)}" ${S.nodeSub === s.id ? 'selected' : ''}>${esc(s.tag || s.id)}${s.nodes ? ' (' + s.nodes.totalCount + ')' : ''}</option>`).join('');
   }
   box.innerHTML = S.subs.map(s => `<div class="card sub-card">
-    <b>${esc(s.tag || ('订阅 ' + s.id))}</b>
-    <div class="meta">
-      <span>节点数：${s.nodes ? s.nodes.totalCount : '—'}　状态：${esc(s.status || '—')}</span>
-      <span>更新于：${ago(parseTime(s.updatedAt)) || '—'}${s.cronEnable && s.cronExp ? '　定时：' + esc(s.cronExp) : ''}</span>
-    </div>
-    ${s.info ? `<div class="info">${esc(s.info)}</div>` : ''}
+    <div class="sh"><b>${esc(s.tag || ('订阅 ' + s.id))}</b><span class="tag">${s.nodes ? s.nodes.totalCount : '—'} 节点</span>${s.cronEnable && s.cronExp ? `<span class="tag ok">cron ${esc(s.cronExp)}</span>` : '<span class="tag">手动</span>'}</div>
+    <div class="meta"><span>上次更新：<span class="mono">${ago(parseTime(s.updatedAt)) || '—'}</span>${s.status ? ' · ' + esc(s.status) : ''}</span></div>
+    <div class="info">${esc((s.link || '').length > 60 ? s.link.slice(0, 60) + '…' : (s.link || ''))}</div>
+    <div class="hint">${s.info ? esc(String(s.info)) : ''}</div>
     <div class="sub-actions">
       <button class="btn btn-sm" data-subaction="update" data-sid="${s.id}">⟳ 立即更新</button>
       <button class="btn btn-sm" data-subaction="edit" data-sid="${s.id}">✎ 编辑</button>
@@ -1772,13 +2002,13 @@ async function captureCurrentScene() {
 function renderScenes() {
   const box = $('#scene-card');
   if (!box) return;
-  const row = (label, desc, btns) => `<div class="scene-row"><div style="min-width:0"><b>${label}</b><div class="hint">${desc}</div></div><div class="form-row" style="margin-left:auto">${btns}</div></div>`;
-  $('#scene-builtin').innerHTML = BUILTIN_SCENES.map(s =>
-    row(esc(s.name), esc(s.desc), `<button class="btn btn-sm btn-primary" data-scene="builtin:${s.id}">应用</button>`)).join('');
+  const card = (name, desc, btns, active) => `<div class="card scene-card${active ? ' active' : ''}"><div class="sh">${active ? '<span class="dot on"></span>' : ''}${name}${active ? '<span class="tag ok">使用中</span>' : ''}</div><div class="desc">${desc}</div><div class="sub-actions">${btns}</div></div>`;
+  $('#scene-builtin').innerHTML = `<div class="scene-grid">` + BUILTIN_SCENES.map(s =>
+    card(esc(s.name), esc(s.desc), `<button class="btn btn-sm btn-primary" data-scene="builtin:${s.id}">应用</button>`)).join('') + `</div>`;
   const custom = scenesLoadAll();
   $('#scene-custom').innerHTML = custom.length
-    ? custom.map(s => row(esc(s.name), esc((s.desc || '') + ' · ' + s.actions.length + ' 个动作'),
-        `<button class="btn btn-sm btn-primary" data-scene="custom:${s.id}">应用</button><button class="btn btn-sm btn-danger" data-scene-del="${s.id}">删</button>`)).join('')
+    ? `<div class="scene-grid">` + custom.map(s => card(esc(s.name), esc((s.desc || '') + ' · ' + s.actions.length + ' 个动作'),
+        `<button class="btn btn-sm btn-primary" data-scene="custom:${s.id}">应用</button><button class="btn btn-sm btn-danger" data-scene-del="${s.id}">删</button>`)).join('') + `</div>`
     : '<div class="hint">暂无——用下方按钮把当前状态存为预设</div>';
 }
 
@@ -1886,6 +2116,14 @@ async function pageSettings(el) {
       : '未读到全局配置';
   } catch (e) { const info = $('#st-cfginfo'); if (info) info.textContent = '全局配置读取失败：' + e.message; }
   // 场景预设
+  el.insertAdjacentHTML('beforeend', `
+    <div class="section-title">关于</div>
+    <div style="display:flex;flex-direction:column;gap:6px;font-size:12.5px;color:var(--text-2);max-width:560px">
+      <div>daed-board · 原生零依赖的 daed 运维控制台（跑在 uhttpd 静态目录，LuCI「服务 → Daed 仪表盘」内嵌）</div>
+      <div>后端：<span class="mono" id="about-version">—</span> · 数据走 GraphQL（wing.db 唯一合法写入口）与 <span class="mono">/cgi-bin/daed-board-log</span>（连接日志与内存）</div>
+      <div>安全：写操作均有确认与快照（区域托管/钉选一键还原）；命脉规则移除强制二次确认。</div>
+    </div>`);
+
   $('#scene-save').addEventListener('click', async () => {
     if (sceneBusy || steerBusy) return toast('有操作正在执行…', 'err');
     let actions;
@@ -1961,15 +2199,25 @@ const CFG_TABS = {
 function pageConfig(el) {
   if (!S.cfgTab) S.cfgTab = 'routing';
   el.innerHTML = `
-    <div class="ctrl">
-      <div class="chip-row" style="padding:0">
-        ${[['routing', '路由'], ['dns', 'DNS'], ['global', '全局配置']].map(([t, n]) => `<span class="chip-btn ${S.cfgTab === t ? 'on' : ''}" data-cfgtab="${t}">${n}</span>`).join('')}
-      </div>
-      <div class="spacer"></div>
-      <span class="hint" id="cf-modified"></span>
-      <button class="btn btn-primary" id="cf-apply">⚡ 应用改动 (run)</button>
+    <div class="alert"><span aria-hidden="true">⛨</span>
+      <div><b>命脉保护已启用：</b>路由首条 <span class="mono">pname(...dnsmasq)->must_direct</span> 与 DNS 上游 <span class="mono">1.1.1.1</span> 若被移除，保存时将强制二次确认——它们是全网干净解析的命脉。</div>
     </div>
-    <div id="cfg-body"><div class="empty">加载中…</div></div>`;
+    <div class="cfg-layout">
+      <div>
+        <div class="section-title">编辑器</div>
+        <div class="cfg-tabs">
+          ${[['routing', '路由规则', '多版本'], ['dns', 'DNS', '多版本'], ['global', '全局配置', '33 字段']].map(([t, n, v]) => `<div class="cfg-tab ${S.cfgTab === t ? 'on' : ''}" data-cfgtab="${t}"><span>${n}</span><span class="v">${v}</span></div>`).join('')}
+        </div>
+        <div class="section-title">状态</div>
+        <div style="padding:0 12px"><span class="hint" id="cf-modified"></span></div>
+      </div>
+      <div>
+        <div class="toolbar" style="justify-content:flex-end">
+          <button class="btn btn-primary btn-sm" id="cf-apply">⚡ 应用改动 (run)</button>
+        </div>
+        <div id="cfg-body"><div class="empty">加载中…</div></div>
+      </div>
+    </div>`;
   $('#cf-apply').addEventListener('click', cfgApply);
   el.addEventListener('click', e => {
     const tb = e.target.closest('[data-cfgtab]');
@@ -2027,22 +2275,24 @@ async function cfgRenderText(kind) {
   const item = list.find(x => x.id === prev.editId) || list.find(x => x.selected) || list[0] || {};
   const st = S.cfgText[kind] = { list, editId: item.id, text: (kind === 'routing' ? item.routing : item.dns) || '' };
   st.text = st.text && st.text.string || '';
+  const ruleCount = kind === 'routing' ? st.text.split(String.fromCharCode(10)).filter(l => l.trim() && !l.trim().startsWith('#')).length : 0;
   body.innerHTML = `
-    <div class="card card-pad">
-      <div class="form-row" style="margin-bottom:10px">
-        <label class="check" style="color:var(--text)">版本
-          <select class="select" id="cfg-ver">${list.map(v => `<option value="${esc(v.id)}" ${v.id === st.editId ? 'selected' : ''}>${esc(v.name || v.id)}${v.selected ? '（当前）' : ''}</option>`).join('')}</select>
-        </label>
-        <button class="btn btn-sm" id="cfg-new">＋ 新建版本</button>
-        <button class="btn btn-sm btn-danger" id="cfg-del">删除此版本</button>
-        ${item.selected ? '' : '<button class="btn btn-sm" id="cfg-select">设为当前</button>'}
-        <span class="hint">${item.selected ? '✓ 当前生效版本' : '非当前版本（设为当前 + 应用后启用）'}</span>
-      </div>
-      <textarea id="cfg-text" class="cfg-editor" spellcheck="false">${esc(st.text)}</textarea>
-      <div class="form-row" style="margin-top:10px">
-        <button class="btn" id="cfg-do-verify">① 校验</button>
-        <button class="btn btn-primary" id="cfg-do-save">② 保存</button>
-        <span class="hint" id="cfg-verify"></span>
+    <div class="toolbar" style="margin-bottom:8px">
+      <span class="tag ${item.selected ? 'ok' : ''}">${item.selected ? '✓ 当前生效版本' : '非当前版本（设为当前 + 应用后启用）'}</span>
+      ${kind === 'routing' ? `<span class="hint">${ruleCount} 条匹配</span>` : ''}
+      <span class="spacer"></span>
+      <button class="btn btn-sm" id="cfg-new">＋ 新建版本</button>
+    </div>
+    <textarea id="cfg-text" class="cfg-editor" spellcheck="false">${esc(st.text)}</textarea>
+    <div class="toolbar" style="margin-top:10px">
+      <label class="check" style="color:var(--text-2)">版本
+        <select class="select" id="cfg-ver">${list.map(v => `<option value="${esc(v.id)}" ${v.id === st.editId ? 'selected' : ''}>${esc(v.name || v.id)}${v.selected ? '（当前）' : ''}</option>`).join('')}</select>
+      </label>
+      <button class="btn btn-sm" id="cfg-do-verify">① 校验</button>
+      <button class="btn btn-primary btn-sm" id="cfg-do-save">② 保存</button>
+      <button class="btn btn-danger btn-sm" id="cfg-del">删除此版本</button>
+      ${item.selected ? '' : '<button class="btn btn-sm" id="cfg-select">设为当前</button>'}
+      <span class="hint" id="cfg-verify"></span>
       </div>
       <div class="hint">${kind === 'routing'
         ? '首条规则 pname(...dnsmasq) -> must_direct 是 DNS 干净解析的命脉，移除会被强制二次确认。'
@@ -2155,22 +2405,21 @@ async function cfgRenderGlobal() {
   const fieldHtml = f => `<label class="cf-field"><span>${f[1]}</span>${finput(f)}${f[4] && f[3] !== 'select' && f[3] !== 'bool' ? `<span class="fhint">${esc(f[4])}</span>` : ''}</label>`;
   const grp = gname => GLOBAL_FIELDS.filter(f => f[2] === gname).map(fieldHtml).join('');
   body.innerHTML = `
-    <div class="card card-pad">
-      <div class="form-row" style="margin-bottom:10px">
-        <label class="check" style="color:var(--text)">配置版本
-          <select class="select" id="cfg-gver">${list.map(v => `<option value="${esc(v.id)}" ${v.id === S.cfgGlobal.id ? 'selected' : ''}>${esc(v.name || v.id)}${v.selected ? '（当前）' : ''}</option>`).join('')}</select>
-        </label>
-        <span class="hint">⚠ 保存后需「应用改动」生效；此处可覆盖 tproxy/接口等核心参数，请谨慎修改高级项。</span>
-      </div>
-      <div class="cf-grid">${grp('常用')}</div>
-      <details style="margin-top:12px"><summary class="section-title" style="cursor:pointer">高级（危险/低频项，默认勿动）</summary>
-        <div class="cf-grid" style="margin-top:10px">${grp('高级')}</div>
-      </details>
-      <div class="form-row" style="margin-top:14px">
-        <button class="btn btn-primary" id="cfg-gsave">保存</button>
-        <button class="btn" id="cfg-gsnap">还原到快照</button>
-        <span class="hint" id="cfg-gmsg"></span>
-      </div>
+    <div class="toolbar" style="margin-bottom:10px">
+      <label class="check" style="color:var(--text-2)">配置版本
+        <select class="select" id="cfg-gver">${list.map(v => `<option value="${esc(v.id)}" ${v.id === S.cfgGlobal.id ? 'selected' : ''}>${esc(v.name || v.id)}${v.selected ? '（当前）' : ''}</option>`).join('')}</select>
+      </label>
+      <span class="hint">⚠ 保存后需「应用改动」生效；此处可覆盖 tproxy/接口等核心参数，请谨慎修改高级项。</span>
+    </div>
+    <div class="section-title">常用字段</div>
+    <div class="cf-grid">${grp('常用')}</div>
+    <details style="margin-top:12px"><summary class="section-title" style="cursor:pointer">高级（危险/低频项，默认勿动）</summary>
+      <div class="cf-grid" style="margin-top:10px">${grp('高级')}</div>
+    </details>
+    <div class="toolbar" style="margin-top:14px">
+      <button class="btn btn-primary" id="cfg-gsave">保存</button>
+      <button class="btn" id="cfg-gsnap">还原到快照</button>
+      <span class="hint" id="cfg-gmsg"></span>
     </div>`;
   const q = s => body.querySelector(s);
   q('#cfg-gver').addEventListener('change', e => {
@@ -2263,13 +2512,23 @@ $('#login-form').addEventListener('submit', async ev => {
 function updateNavState() {
   const el = $('#nav-state');
   const g = S.general;
-  if (!el) return;
-  if (g) {
-    el.textContent = (g.dae.running ? '运行中' : '已停止') + ' · ' + (g.dae.version || '');
-    el.className = g.dae.running ? 'on' : '';
-  } else el.textContent = '连接中…';
+  if (el) {
+    if (g) {
+      el.textContent = '已连接 · ' + (S.cfg.backend || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
+      el.className = 'on';
+    } else el.textContent = '连接中…';
+  }
+  const dot = $('#nav-dot'), core = $('#nav-core'), ver = $('#nav-version');
+  if (g && dot) dot.className = 'dot ' + (g.dae.running ? 'on' : 'off');
+  if (core) core.textContent = g ? (g.dae.running ? '核心运行中' : '核心已停止') : '核心状态';
+  if (ver) ver.textContent = g && g.dae.version ? g.dae.version : '';
   const link = $('#nav-daed-link');
   if (link && S.cfg.backend) link.href = S.cfg.backend.replace(/\/+$/, '');
+  const av = $('#about-version');
+  if (av && g) av.textContent = 'dae ' + (g.dae.version || '') + (g.dae.modified ? ' · 有改动未应用' : '');
+  renderNav();
+  topChips();
+  updateBell();
 }
 
 /* ================= 轮询 ================= */
@@ -2306,6 +2565,10 @@ async function boot() {
   $('#app').hidden = false;
   $('#login').hidden = true;
   S.lastTs = {};
+  const runBtn = $('#tb-run');
+  if (runBtn) runBtn.addEventListener('click', cfgApply);
+  const bell = $('#tb-bell');
+  if (bell) bell.addEventListener('click', openDrawer);
   await steerSyncFromServer().catch(() => {}); // 跨设备同步托管状态
   if (!location.hash) location.hash = '#/proxies';
   else onRoute();

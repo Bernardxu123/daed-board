@@ -4,4 +4,5 @@
 # 首行附带路由器内存可用量（#MEM kb），供概览页监控长期运行状态。
 printf 'Content-Type: text/plain; charset=utf-8\r\n\r\n'
 awk '/MemAvailable/{print "#MEM " $2; exit}' /proc/meminfo 2>/dev/null
+tail -n 8 /tmp/daed-guard.log 2>/dev/null | sed 's/^/#GUARD /'
 tail -n 600 /var/log/daed/daed.log 2>/dev/null
