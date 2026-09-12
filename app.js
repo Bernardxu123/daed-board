@@ -157,15 +157,27 @@ async function login(user, pass) {
 }
 
 /* ---------- API（已在 api 层拆掉 GraphQL data 信封） ---------- */
-const api = {
-  groups: async () => (await gql(`query { groups { id name policy policyParams { key val }
+/* 1.10 轮询合并：把 groups / nodeLatencies 的字段集抽出来，供概览页批量查询复用 */
+const GROUPS_Q = `groups { id name policy policyParams { key val }
       nodes { id name address protocol tag subscriptionID }
-      subscriptions { subscription { id tag } nameFilterRegex matchedCount matchedNodes { id name address protocol tag subscriptionID } } } }`)).groups,
+      subscriptions { subscription { id tag } nameFilterRegex matchedCount matchedNodes { id name address protocol tag subscriptionID } } }`;
+const LATS_Q = `nodeLatencies { id latencyMs alive testedAt message }`;
+
+const api = {
+  groups: async () => (await gql(`query { ${GROUPS_Q} }`)).groups,
   latencies: async ids => (await gql(`query($ids:[ID!]) { nodeLatencies(ids:$ids) { id latencyMs alive testedAt message } }`, { ids })).nodeLatencies,
   test: async ids => (await gql(`mutation($ids:[ID!]) { testNodeLatencies(ids:$ids) { id latencyMs alive testedAt message } }`, { ids }, 300000)).testNodeLatencies,
-  general: async () => (await gql(`query { general { dae { running modified version }
+  /* 1.2 自适应窗口：缓冲不足时回填 10 分钟（240 点 ≈2.75s/点），
+   * 稳态只取 2 分钟（60 点 ≈2.25s/点）——比改动前的固定 600/120（5.25s/点、10.4KB）更密且更省。
+   * 1.10 withLatency=true 时把 groups + 全量 nodeLatencies 并进同一条查询（概览页每 30s 触发一次），
+   * 于是"速率 / 分组 / 延迟"在同一个往返里原子返回，省一次 POST 与一次 CORS 预检。 */
+  overview: async ({ backfill = false, withLatency = false } = {}) => {
+    const win = backfill ? 600 : 120, mp = backfill ? 240 : 60;
+    return gql(`query { general { dae { running modified version }
       interfaces { name flag { up } ip }
-      runtimeOverview(windowSec: 600, maxPoints: 120) { updatedAt uploadRate downloadRate uploadTotal downloadTotal activeConnections udpSessions samples { timestamp uploadRate downloadRate } } } }`)).general,
+      runtimeOverview(windowSec: ${win}, maxPoints: ${mp}) { updatedAt uploadRate downloadRate uploadTotal downloadTotal activeConnections udpSessions samples { timestamp uploadRate downloadRate } } } ${withLatency ? GROUPS_Q + ' ' + LATS_Q : ''} }`);
+  },
+  general: async () => (await api.overview({ backfill: true })).general,
   nodesPage: () => gql(`query { nodes(first: 999) { totalCount edges { id name address protocol tag subscriptionID } }
       subscriptions { id tag link updatedAt status info cronExp cronEnable nodes(first: 999) { totalCount edges { id name address protocol tag subscriptionID } } } }`, null, 60000),
   selectedCfg: async () => (await gql(`query { configs(selected: true) { name global { dialMode checkInterval checkTolerance sniffingTimeout tcpCheckUrl logLevel } } }`)).configs,
@@ -256,6 +268,47 @@ function ingestLog(text) {
   const rec = new Map();
   for (const e of S.logEntries) if (!rec.has(e.outbound)) rec.set(e.outbound, { raw: e.dialer || '', ts: e.ts, entry: e });
   S.recent = rec;
+}
+/* 1.7 DNS 上游失败 → 通知中心。
+ * parseLogLine 只收 INFO 行，WARN 被整段丢弃，于是"某次网站打不开"只留在日志里没人看见。
+ * key 由 notifPush 按 lv|b|p 去重，所以这里**不带时间戳**（否则同一次故障每次轮询都会新增一条）；
+ * 同一域名在一轮里只出一条，hard（真的发了 SERVFAIL）优先。 */
+function qnameFromDohB64(b64) {
+  try {
+    const bin = atob(String(b64).replace(/-/g, '+').replace(/_/g, '/'));
+    const out = [];
+    let i = 12;                                  // 跳过 DNS 报文头
+    while (i < bin.length) {
+      const len = bin.charCodeAt(i++);
+      if (!len) break;
+      out.push(bin.slice(i, i + len));
+      i += len;
+    }
+    return out.length ? out.join('.') : null;
+  } catch { return null; }
+}
+function dnsWarnEvents(text) {
+  const byWho = new Map();
+  for (const ln of String(text).split('\n')) {
+    const hard = ln.includes('DNS ingress fast path failed');
+    const fwd = ln.includes('DNS forward to upstream failed');
+    if (!hard && !fwd) continue;
+    const kind = ln.includes('http3:') ? 'HTTP/3 超时'
+      : ln.includes('TLS handshake timeout') ? 'TLS 握手超时'
+      : /timeout|timed out/.test(ln) ? '上游超时' : '上游失败';
+    const q = /question=\[\{Name:([^}\s\]]+)/.exec(ln);
+    const b64 = /\?dns=([A-Za-z0-9_-]+)/.exec(ln);
+    const who = (q && q[1]) || (b64 && qnameFromDohB64(b64[1])) || '未知域名';
+    const prev = byWho.get(who);
+    if (prev && !(prev.lv === 'warn' && hard)) continue;
+    byWho.set(who, {
+      lv: hard ? 'err' : 'warn',
+      b: `DNS ${hard ? '解析失败（客户端收到 SERVFAIL）' : '上游转发失败'} · ${kind}`,
+      p: hard ? `${who} —— 该查询直接失败，表现为「网站打不开」；可到出口记录页核对`
+              : `${who} —— 上游转发失败，将尝试备用上游`,
+    });
+  }
+  return [...byWho.values()];
 }
 function dialerMatchesNode(rawDialer, nodeName) {
   if (!rawDialer || !nodeName) return false;
@@ -627,7 +680,9 @@ async function nodeIndex() {
 
 async function steerAudit() {
   if (steerBusy) return;
-  const all = await steerSyncFromServer();
+  // 1.5 只读本地快照：跨设备同步改在启动时做一次
+  //（改动前每轮审计都 await steerSyncFromServer()，即每 30s 多读一次 ~47KB jsonStorage）
+  const all = steerLoadAll();
   const gids = Object.keys(all);
   if (!gids.length) return;
   if (!S.groups.length) return; // 组列表未就绪时绝不审计（防止误撤销托管状态）
@@ -646,14 +701,18 @@ async function steerAudit() {
       toast('检测到未完成的区域托管，已撤销', 'ok');
       continue;
     }
-    // 快照 id 自愈：订阅更新重建 id 后按名称找回
+    // 快照 id 自愈：订阅更新重建 id 后按名称找回。
+    // 1.6 重映射是幂等的 → 先记原值，只有真的变了才标脏写回
+    //（改动前这里无条件 changed = true，于是每 30s 把整份托管快照 ~47KB 重写一次 jsonStorage）
+    const snapOf = x => JSON.stringify([x.backup.explicitIds, x.backup.pool, x.targetIds, x.addedIds]);
+    const before = snapOf(st);
     const remap = remapOf(st);
     const dedupe = a => [...new Set(a)];
     st.backup.explicitIds = dedupe((st.backup.explicitIds || []).map(remap).filter(Boolean));
     st.backup.pool = (st.backup.pool || []).map(p => ({ ...p, id: remap(p.id) || p.id }));
     st.targetIds = dedupe((st.targetIds || []).map(remap).filter(Boolean));
     st.addedIds = dedupe((st.addedIds || []).map(remap).filter(Boolean));
-    changed = true;
+    if (snapOf(st) !== before) changed = true;
     // 掉员修复：托管目标节点被订阅更新等移除时补回
     const curIds = new Set(g.nodes.map(n => n.id));
     const missing = st.targetIds.filter(id => !curIds.has(id));
@@ -928,26 +987,36 @@ async function onPolicyChange(e) {
   }
   refreshGroups(false);
 }
+// 运行时节点池 = 显式节点 + 订阅匹配节点（去重；fixed 索引仍以显式 nodes 为准）
+function buildPool(g) {
+  const seen = new Set(g.nodes.map(n => n.id));
+  g.pool = [...g.nodes];
+  for (const s of g.subscriptions || []) for (const n of s.matchedNodes || []) {
+    if (!seen.has(n.id)) { seen.add(n.id); g.pool.push(n); }
+  }
+  return g.pool;
+}
+/* 分组数据落地 + 连带刷新。lats 可以是全量 nodeLatencies（1.10 批量查询会带上未入池的节点），
+ * 这里按池内 id 过滤：否则会把未入池节点的延迟写进延迟历史。 */
+function applyGroupsPayload(groups, lats) {
+  S.groups = groups || [];
+  for (const g of S.groups) buildPool(g);
+  const pool = new Set(S.groups.flatMap(g => g.pool.map(n => n.id)));
+  const keep = (lats || []).filter(l => pool.has(l.id));
+  if (keep.length) applyLatencies(keep);
+  renderGroups();
+  steerAudit().catch(() => {});
+  if (S.page === 'logs') renderLogPage();
+  updateNavState();
+  notifDerived();
+}
 async function refreshGroups(manual) {
   if (S.inflight.has('groups')) return;
   S.inflight.add('groups');
   try {
-    S.groups = (await api.groups()) || [];
-    // 运行时节点池 = 显式节点 + 订阅匹配节点（去重；fixed 索引仍以显式 nodes 为准）
-    for (const g of S.groups) {
-      const seen = new Set(g.nodes.map(n => n.id));
-      g.pool = [...g.nodes];
-      for (const s of g.subscriptions || []) for (const n of s.matchedNodes || []) {
-        if (!seen.has(n.id)) { seen.add(n.id); g.pool.push(n); }
-      }
-    }
-    const ids = [...new Set(S.groups.flatMap(g => g.pool.map(n => n.id)))];
-    if (ids.length) applyLatencies(await api.latencies(ids));
-    renderGroups();
-    steerAudit().catch(() => {});
-    if (S.page === 'logs') renderLogPage();
-    updateNavState();
-    notifDerived();
+    const gs = (await api.groups()) || [];
+    const ids = [...new Set(gs.flatMap(g => buildPool(g).map(n => n.id)))];
+    applyGroupsPayload(gs, ids.length ? await api.latencies(ids) : []);
     if (manual) toast('已刷新', 'ok');
   } catch (e) {
     if (e instanceof AuthError) return handleAuthError();
@@ -1280,14 +1349,20 @@ function pageOverview(el) {
   el.innerHTML = `<div id="ov-body"><div class="empty">加载中…</div></div>`;
   refreshGeneral();
 }
+let ovGroupsTs = 0; // 1.10 上次把 groups/nodeLatencies 并进概览查询的时刻
 async function refreshGeneral() {
   if (S.inflight.has('general')) return;
   S.inflight.add('general');
   try {
-    S.general = await api.general();
+    const backfill = S.ovBuf.length < 60;                                   // 1.2 缓冲不足 → 回填 10 分钟
+    const wantGroups = Date.now() - ovGroupsTs > Math.max(10, S.cfg.groupSec - 5) * 1000;
+    if (wantGroups) ovGroupsTs = Date.now();
+    const d = await api.overview({ backfill, withLatency: wantGroups && !!S.groups.length });
+    S.general = d.general;
     mergeSamples(S.general && S.general.runtimeOverview);
     if (!S.cfgGlobal) { try { S.cfgGlobal = (await api.configsAll()).find(x => x.selected) || null; } catch {} }
     if (!S.subs || !S.subs.length) { try { S.subs = (await api.nodesPage()).subscriptions || []; } catch {} }
+    if (d.groups) applyGroupsPayload(d.groups, d.nodeLatencies);            // 1.10 与速率同一往返返回
     renderOverview();
     updateNavState();
     notifDerived();
@@ -1306,44 +1381,88 @@ function mergeSamples(ov) {
   S.ovBuf.sort((a, b) => a.ts - b.ts);
   if (S.ovBuf.length > 900) S.ovBuf = S.ovBuf.slice(-900);
 }
-function renderOverview() {
-  const box = $('#ov-body');
-  if (!box || !S.general) return;
+/* 1.3 按**时间戳**取窗口：不要用 slice(-N) 切片——采样密度一变，点数含义就变了
+ *（-120 在 5.25s/点时是 10 分钟，在 2.75s/点时只有 5.5 分钟）。 */
+function ovWindow(sec) {
+  if (!S.ovBuf.length) return [];
+  const t1 = S.ovBuf[S.ovBuf.length - 1].ts;
+  const from = t1 - sec * 1000;
+  const i = S.ovBuf.findIndex(s => s.ts >= from);
+  return i <= 0 ? S.ovBuf.slice() : S.ovBuf.slice(i);
+}
+/* 概览页本轮的全部动态值（结构层与数值层共用，避免两处各算一遍） */
+function ovModel() {
   const g = S.general, ov = g.runtimeOverview || {};
-  const tail = S.ovBuf.slice(-6);
+  // 1.1 KPI 用最近 2 个采样点均值（≈5.5s 窗口，比改动前的 6 点均值 / 22.5s 快 4 倍）。
+  // 瞬时值单独展示：顶层 uploadRate 是 daed 0.25s 网格的最新样本，空闲时实测会直接掉到 0，
+  // 拿它当主数字会闪，所以主数字用 2 点均值，瞬时值放刻度行。
+  const tail = S.ovBuf.slice(-2);
   const upNow = tail.length ? tail.reduce((a, s) => a + s.up, 0) / tail.length : ov.uploadRate || 0;
   const downNow = tail.length ? tail.reduce((a, s) => a + s.down, 0) / tail.length : ov.downloadRate || 0;
-  const dlSpark = S.ovBuf.slice(-60).map(s => s.down);
-  const ulSpark = S.ovBuf.slice(-60).map(s => s.up);
+  const upInstant = ov.uploadRate || 0, downInstant = ov.downloadRate || 0;
+  const win = ovWindow(600);
+  const dlSpark = win.map(s => s.down), ulSpark = win.map(s => s.up);
   const memSpark = memHistLoad().slice(-60).map(p => p.kb / 1024);
   const memMB = S.memAvailKB ? Math.round(S.memAvailKB / 1024) : null;
   let aliveN = 0, totalN = 0;
   for (const gr of S.groups) for (const n of (gr.pool || gr.nodes || [])) { totalN++; const l = S.lat.get(n.id); if (l && l.alive) aliveN++; }
-  const ifaces = (g.interfaces || []).filter(i => i.flag && i.flag.up && (i.ip || []).some(ip => !/^(fe80|127\.)/.test(ip)));
+  const peak = Math.max(0, ...win.map(s => Math.max(s.up, s.down)));
+  const ax = {
+    start: win.length ? hhmm(win[0].ts) : '',
+    end: win.length ? hhmm(win[win.length - 1].ts) : '',
+    peak: fmtRate(peak),
+  };
   const cfg = S.cfgGlobal && S.cfgGlobal.global ? S.cfgGlobal.global : {};
-  const notifs = notifLoad();
   const guardTail = S.guardLog || [];
-
-  box.innerHTML = `
+  const tasks = [
+    ...(S.subs || []).map(s => ({ st: s.cronEnable ? 'run' : 'idle', icon: s.cronEnable ? '⟳' : '◦',
+      name: `订阅「${s.tag || s.id}」`, tags: [s.cronEnable ? `cron ${s.cronExp}` : '手动'],
+      m: `节点 ${s.nodes && s.nodes.totalCount != null ? s.nodes.totalCount : '—'} 个 · 上次更新 ${ago(parseTime(s.updatedAt)) || '—'}`, acts: [] })),
+    { st: guardTail.length && /restart/.test(guardTail[0]) ? 'warn' : 'ok', icon: '🛡', name: '内存守卫 daed-guard',
+      tags: ['阈值 180MB', '连续 2 天确认'], m: guardTail.length ? guardTail[0] : '每日 04:30 检查 · 暂无记录', acts: [] },
+    { st: 'idle', icon: '⚡', name: '场景预设', tags: ['日常模式'], m: '设置页一键切换托管/策略/日志组合', acts: [{ n: '去设置', nav: 'settings' }] },
+  ];
+  return { g, ov, upNow, downNow, upInstant, downInstant, dlSpark, ulSpark, memSpark, memMB,
+           aliveN, totalN, cfg, notifs: notifLoad(), guardTail, tasks, ax };
+}
+/* 结构键：只有会改变元素「集合 / 顺序」的东西才进来；纯数值变化交给 ovUpdate() 定点更新。
+ * 改动前每次 3s 轮询都重建整页 innerHTML → 闪烁、丢滚动位置与展开态、手机端掉帧。 */
+function ovStructKey() {
+  const g = S.general || {}, cfg = (S.cfgGlobal && S.cfgGlobal.global) || {};
+  return [
+    S.groups.map(gr => [gr.id, gr.name, gr.policy, (gr.pool || gr.nodes || []).length,
+      steerGet(gr.id) ? 'S' : '-', recentFor(gr) ? 'R' : '-',
+      gr.policy === 'fixed' && fixedNodeFor(gr) ? fixedNodeFor(gr).id : '-'].join('|')).join(','),
+    (S.subs || []).map(s => [s.id, s.cronEnable ? 1 : 0, s.nodes && s.nodes.totalCount].join('|')).join(','),
+    (S.guardLog || []).length,
+    notifLoad().slice(0, 6).map(n => [n.lv, n.b, n.p, n.t].join('|')).join(','),
+    g.dae ? [g.dae.running, g.dae.modified, g.dae.version].join('|') : '',
+    cfg.dialMode, cfg.logLevel, cfg.checkInterval, cfg.checkTolerance,
+  ].join('~');
+}
+function ovHtml(m) {
+  const { g, ov, upNow, downNow, dlSpark, ulSpark, memSpark, memMB,
+          aliveN, totalN, cfg, notifs, tasks, ax } = m;
+  return `
   <div class="kpi-grid">
     <div class="card kpi"><div class="lbl">下载速率</div>
-      <div class="val" style="color:var(--primary)">${fmtRate(downNow)}<small>↓</small></div>
-      <div class="ctx">累计 ↓${fmtBytes(ov.downloadTotal)}</div>
-      <div class="spark">${dlSpark.length >= 2 ? sparkline(dlSpark, 'var(--primary)') : ''}</div></div>
+      <div class="val" id="kpi-dl-val" style="color:var(--primary)">${fmtRate(downNow)}<small>↓</small></div>
+      <div class="ctx" id="kpi-dl-ctx">累计 ↓${fmtBytes(ov.downloadTotal)} · 瞬时 ${fmtRate(ov.downloadRate || 0)}</div>
+      <div class="spark" id="sp-dl">${dlSpark.length >= 2 ? sparkline(dlSpark, 'var(--primary)') : ''}</div></div>
     <div class="card kpi"><div class="lbl">上传速率</div>
-      <div class="val" style="color:var(--success)">${fmtRate(upNow)}<small>↑</small></div>
-      <div class="ctx">累计 ↑${fmtBytes(ov.uploadTotal)}</div>
-      <div class="spark">${ulSpark.length >= 2 ? sparkline(ulSpark, 'var(--success)') : ''}</div></div>
+      <div class="val" id="kpi-ul-val" style="color:var(--success)">${fmtRate(upNow)}<small>↑</small></div>
+      <div class="ctx" id="kpi-ul-ctx">累计 ↑${fmtBytes(ov.uploadTotal)} · 瞬时 ${fmtRate(ov.uploadRate || 0)}</div>
+      <div class="spark" id="sp-ul">${ulSpark.length >= 2 ? sparkline(ulSpark, 'var(--success)') : ''}</div></div>
     <div class="card kpi"><div class="lbl">活动连接</div>
-      <div class="val">${ov.activeConnections ?? '—'}<small>会话</small></div>
-      <div class="ctx">UDP ${ov.udpSessions ?? '—'} · 仅代理出站记录</div></div>
+      <div class="val" id="kpi-conn-val">${ov.activeConnections ?? '—'}<small>会话</small></div>
+      <div class="ctx" id="kpi-conn-ctx">UDP ${ov.udpSessions ?? '—'} · 仅代理出站记录</div></div>
     <div class="card kpi"><div class="lbl">内存可用</div>
-      <div class="val" style="color:${memMB != null && memMB < 180 ? 'var(--warning)' : ''}">${memMB ?? '—'}<small>MB</small></div>
+      <div class="val" id="kpi-mem-val" style="color:${memMB != null && memMB < 180 ? 'var(--warning)' : ''}">${memMB ?? '—'}<small>MB</small></div>
       <div class="ctx"><span class="warnt">阈值 180 / 红线 150</span></div>
-      <div class="spark">${memSpark.length >= 2 ? sparkline(memSpark, 'var(--warning)') : ''}</div></div>
+      <div class="spark" id="sp-mem">${memSpark.length >= 2 ? sparkline(memSpark, 'var(--warning)') : ''}</div></div>
     <div class="card kpi"><div class="lbl">节点存活</div>
-      <div class="val">${aliveN}<small>/ ${totalN}</small></div>
-      <div class="ctx">${S.groups.length} 个分组 · min 策略自动择优</div></div>
+      <div class="val" id="kpi-alive-val">${aliveN}<small>/ ${totalN}</small></div>
+      <div class="ctx" id="kpi-alive-ctx">${S.groups.length} 个分组 · min 策略自动择优</div></div>
   </div>
 
   <div class="ov-grid">
@@ -1351,10 +1470,10 @@ function renderOverview() {
       <div class="card-head"><h2>实时速率</h2><span class="sub">来源 runtimeOverview 采样</span>
         <span class="spacer"></span>
         <span class="legend"><span class="lg-dl"><i></i>下载</span><span class="lg-ul"><i></i>上传</span></span></div>
-      <div class="chart-meta"><span class="big pdn">${fmtRate(downNow)}<i>下载</i></span><span class="big pub">${fmtRate(upNow)}<i>上传</i></span>
-        <span class="hint">更新于 ${hhmm(parseTime(ov.updatedAt)) || '—'}</span></div>
+      <div class="chart-meta"><span class="big pdn" id="ov-big-dl">${fmtRate(downNow)}<i>下载</i></span><span class="big pub" id="ov-big-ul">${fmtRate(upNow)}<i>上传</i></span>
+        <span class="hint" id="ov-updated">更新于 ${hhmm(parseTime(ov.updatedAt)) || '—'}</span></div>
       <div class="chart-wrap" id="ov-chart"></div>
-      <div class="chart-axis"><span>${S.ovBuf.length ? hhmm(S.ovBuf[Math.max(0, S.ovBuf.length - 120)].ts) : ''}</span><span>峰值 ${fmtRate(Math.max(0, ...S.ovBuf.slice(-120).map(s => Math.max(s.up, s.down))))}</span><span>${S.ovBuf.length ? hhmm(S.ovBuf[S.ovBuf.length - 1].ts) : ''}</span></div>
+      <div class="chart-axis"><span id="ax-start">${ax.start}</span><span id="ax-peak">峰值 ${ax.peak}</span><span id="ax-end">${ax.end}</span></div>
     </section>
 
     <section class="card span4">
@@ -1368,12 +1487,12 @@ function renderOverview() {
           { k: '日志级别', v: cfg.logLevel || '—' },
           { k: '测速间隔', v: (cfg.checkInterval || '—') + ' / 容差 ' + (cfg.checkTolerance || '—') },
           { k: '内存可用', v: memMB != null ? memMB + ' MB' : '—', tag: memMB != null && memMB < 180 ? 'warn' : 'ok' },
-        ].map(s => `<div class="state-row"><span class="k">${esc(s.k)}</span><span class="v" title="${esc(s.v)}">${esc(s.v)}</span>${s.tag ? `<span class="tag ${s.tag}">${s.tag === 'ok' ? '正常' : s.tag === 'warn' ? '注意' : '停止'}</span>` : ''}</div>`).join('')}
+        ].map((s, i) => `<div class="state-row"><span class="k">${esc(s.k)}</span><span class="v" id="stv-${i}" title="${esc(s.v)}">${esc(s.v)}</span>${s.tag ? `<span class="tag ${s.tag}" id="stt-${i}">${s.tag === 'ok' ? '正常' : s.tag === 'warn' ? '注意' : '停止'}</span>` : ''}</div>`).join('')}
       </div>
     </section>
 
     <section class="card span4">
-      <div class="card-head"><h2>通知中心</h2><span class="tag ${notifUnread() ? 'err' : ''}">${notifUnread()} 条未读</span><span class="spacer"></span>
+      <div class="card-head"><h2>通知中心</h2><span class="tag ${notifUnread() ? 'err' : ''}" id="ov-notif-tag">${notifUnread()} 条未读</span><span class="spacer"></span>
         <button class="btn btn-sm btn-ghost" id="ov-openbell">全部</button><button class="btn btn-sm btn-ghost" id="ov-markread">全部已读</button></div>
       <div class="notif">
         ${notifs.length ? notifs.slice(0, 6).map(n => `
@@ -1386,15 +1505,11 @@ function renderOverview() {
 
     <section class="card span8">
       <div class="card-head"><h2>定时任务与后台操作</h2><span class="sub">订阅 cron · 内存守卫 · 场景预设</span></div>
-      ${[
-        ...(S.subs || []).map(s => ({ st: s.cronEnable ? 'run' : 'idle', icon: s.cronEnable ? '⟳' : '◦', name: `订阅「${s.tag || s.id}」`, tags: [s.cronEnable ? `cron ${s.cronExp}` : '手动'], m: `节点 ${s.nodes && s.nodes.totalCount != null ? s.nodes.totalCount : '—'} 个 · 上次更新 ${ago(parseTime(s.updatedAt)) || '—'}`, acts: [] })),
-        { st: guardTail.length && /restart/.test(guardTail[0]) ? 'warn' : 'ok', icon: '🛡', name: '内存守卫 daed-guard', tags: ['阈值 180MB', '连续 2 天确认'], m: guardTail.length ? guardTail[0] : '每日 04:30 检查 · 暂无记录', acts: [] },
-        { st: 'idle', icon: '⚡', name: '场景预设', tags: ['日常模式'], m: '设置页一键切换托管/策略/日志组合', acts: [{ n: '去设置', nav: 'settings' }] },
-      ].map(t => `
+      ${tasks.map((t, i) => `
       <div class="task">
         <span class="st ${t.st}" aria-hidden="true">${t.icon}</span>
         <div class="ti"><b>${esc(t.name)} ${t.tags.map(x => `<span class="tag ${x.includes('阈值') || x.includes('cron') ? 'p' : ''}">${esc(x)}</span>`).join('')}</b>
-          <div class="m">${esc(t.m)}</div></div>
+          <div class="m" id="task-m-${i}">${esc(t.m)}</div></div>
         <div class="ta">${t.acts.map(a => `<button class="btn btn-sm" data-nav="${a.nav}">${esc(a.n)}</button>`).join('')}</div>
       </div>`).join('')}
     </section>
@@ -1403,7 +1518,7 @@ function renderOverview() {
       <div class="card-head"><h2>分组实际出口</h2><span class="spacer"></span><button class="btn btn-sm btn-ghost" data-nav="logs">出口记录 →</button></div>
       <div class="card-pad">
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px">
-        ${S.groups.map(gr => {
+        ${S.groups.map((gr, i) => {
           const rec = recentFor(gr);
           const pred = predictFor(gr);
           const fixed = gr.policy === 'fixed' ? fixedNodeFor(gr) : null;
@@ -1416,10 +1531,10 @@ function renderOverview() {
             <span class="hint" style="margin-left:auto">${(gr.pool || gr.nodes || []).length} 节点</span>
           </div>
           <div style="display:flex;align-items:center;gap:8px;font-size:12.5px">
-            <span class="dot on"></span><span style="color:var(--success);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${fixed ? '🔒 ' + esc(fixed.name) : (rec ? esc(rec.name) : '—')}</span>
-            <span class="hint" style="margin-left:auto">${rec ? ago(rec.ts) : ''}</span>
+            <span class="dot on"></span><span id="exit-${i}-name" style="color:var(--success);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${fixed ? '🔒 ' + esc(fixed.name) : (rec ? esc(rec.name) : '—')}</span>
+            <span class="hint" id="exit-${i}-ago" style="margin-left:auto">${rec ? ago(rec.ts) : ''}</span>
           </div>
-          ${!fixed && pred ? `<div class="hint">预计出口 ${esc(pred.node.name)}（按延迟均值近似）</div>` : ''}
+          ${!fixed ? `<div class="hint" id="exit-${i}-pred">${pred ? `预计出口 ${esc(pred.node.name)}（按 min_avg10 近似；当前策略 ${esc(gr.policy)}）` : ''}</div>` : ''}
         </div>`;
         }).join('')}
         </div>
@@ -1427,11 +1542,90 @@ function renderOverview() {
       </div>
     </section>
   </div>`;
-  rateChartInto($('#ov-chart'));
+}
+function bindOverviewEvents() {
   const open = $('#ov-openbell');
   if (open) open.addEventListener('click', openDrawer);
   const mark = $('#ov-markread');
   if (mark) mark.addEventListener('click', () => { notifSave(notifLoad().map(x => ({ ...x, read: true }))); updateBell(); renderOverview(); toast('已全部标记为已读', 'ok'); });
+}
+/* 1.9 数值层：只写需要变的节点，不重建 DOM */
+function ovUpdate(m) {
+  const { ov, upNow, downNow, upInstant, downInstant, dlSpark, ulSpark, memSpark, memMB,
+          aliveN, totalN, ax, cfg, g } = m;
+  const el = id => document.getElementById(id);
+  const txt = (id, v) => { const e = el(id); if (e) e.textContent = v; };
+  const html = (id, v) => { const e = el(id); if (e) e.innerHTML = v; };
+
+  html('kpi-dl-val', `${fmtRate(downNow)}<small>↓</small>`);
+  txt('kpi-dl-ctx', `累计 ↓${fmtBytes(ov.downloadTotal)} · 瞬时 ${fmtRate(downInstant)}`);
+  html('kpi-ul-val', `${fmtRate(upNow)}<small>↑</small>`);
+  txt('kpi-ul-ctx', `累计 ↑${fmtBytes(ov.uploadTotal)} · 瞬时 ${fmtRate(upInstant)}`);
+  html('kpi-conn-val', `${ov.activeConnections ?? '—'}<small>会话</small>`);
+  txt('kpi-conn-ctx', `UDP ${ov.udpSessions ?? '—'} · 仅代理出站记录`);
+  const memEl = el('kpi-mem-val');
+  if (memEl) {
+    memEl.style.color = memMB != null && memMB < 180 ? 'var(--warning)' : '';
+    memEl.innerHTML = `${memMB ?? '—'}<small>MB</small>`;
+  }
+  html('kpi-alive-val', `${aliveN}<small>/ ${totalN}</small>`);
+  txt('kpi-alive-ctx', `${S.groups.length} 个分组 · min 策略自动择优`);
+  html('sp-dl', dlSpark.length >= 2 ? sparkline(dlSpark, 'var(--primary)') : '');
+  html('sp-ul', ulSpark.length >= 2 ? sparkline(ulSpark, 'var(--success)') : '');
+  html('sp-mem', memSpark.length >= 2 ? sparkline(memSpark, 'var(--warning)') : '');
+
+  html('ov-big-dl', `${fmtRate(downNow)}<i>下载</i>`);
+  html('ov-big-ul', `${fmtRate(upNow)}<i>上传</i>`);
+  txt('ov-updated', `更新于 ${hhmm(parseTime(ov.updatedAt)) || '—'}`);
+  rateChartInto($('#ov-chart'));
+  txt('ax-start', ax.start);
+  txt('ax-peak', `峰值 ${ax.peak}`);
+  txt('ax-end', ax.end);
+
+  // 系统状态 7 行
+  const states = [
+    { v: g.dae.running ? '运行中' : '已停止', tag: g.dae.running ? 'ok' : 'err' },
+    { v: g.dae.version || '—' },
+    { v: g.dae.modified ? '有改动未应用' : '已生效', tag: g.dae.modified ? 'warn' : 'ok' },
+    { v: cfg.dialMode || '—' },
+    { v: cfg.logLevel || '—' },
+    { v: (cfg.checkInterval || '—') + ' / 容差 ' + (cfg.checkTolerance || '—') },
+    { v: memMB != null ? memMB + ' MB' : '—', tag: memMB != null && memMB < 180 ? 'warn' : 'ok' },
+  ];
+  states.forEach((s, i) => {
+    txt(`stv-${i}`, s.v);
+    const t = el(`stt-${i}`);
+    if (t) t.textContent = s.tag === 'ok' ? '正常' : s.tag === 'warn' ? '注意' : '停止';
+    if (t) t.className = 'tag ' + (s.tag || '');
+  });
+
+  const ntag = el('ov-notif-tag');
+  if (ntag) { ntag.textContent = `${notifUnread()} 条未读`; ntag.className = 'tag ' + (notifUnread() ? 'err' : ''); }
+
+  // 定时任务行的相对时间
+  m.tasks.forEach((t, i) => txt(`task-m-${i}`, t.m));
+
+  // 分组实际出口
+  S.groups.forEach((gr, i) => {
+    const rec = recentFor(gr), pred = predictFor(gr);
+    const fixed = gr.policy === 'fixed' ? fixedNodeFor(gr) : null;
+    html(`exit-${i}-name`, fixed ? '🔒 ' + esc(fixed.name) : (rec ? esc(rec.name) : '—'));
+    txt(`exit-${i}-ago`, rec ? ago(rec.ts) : '');
+    const p = el(`exit-${i}-pred`);
+    if (p) p.textContent = pred ? `预计出口 ${pred.node.name}（按 min_avg10 近似；当前策略 ${gr.policy}）` : '';
+  });
+}
+function renderOverview() {
+  const box = $('#ov-body');
+  if (!box || !S.general) return;
+  const m = ovModel();
+  const key = ovStructKey();
+  if (key !== S._ovKey || !box.querySelector('.kpi-grid')) {   // 结构变了才重建骨架
+    S._ovKey = key;
+    box.innerHTML = ovHtml(m);
+    bindOverviewEvents();
+  }
+  ovUpdate(m);                                                 // 每次轮询只走定点更新
 }
 
 /* ================= SVG 图表生成器 ================= */
@@ -1447,8 +1641,8 @@ function sparkline(vals, color, w = 120, h = 30) {
 }
 function rateChartInto(box) {
   if (!box) return;
-  const buf = S.ovBuf.slice(-120);
-  if (buf.length < 2) { box.innerHTML = '<div class="hint" style="padding:16px">速率采样中…（runtimeOverview 每 3 秒回流一个点）</div>'; return; }
+  const buf = ovWindow(600);                    // 1.3 按时间窗（近 10 分钟）取，不按点数切
+  if (buf.length < 2) { box.innerHTML = '<div class="hint" style="padding:16px">速率采样中…（每 3 秒拉一次；单点间隔由 daed 采样密度决定）</div>'; return; }
   const W = 600, H = 168, pad = 6;
   const maxV = Math.max(1, ...buf.map(s => Math.max(s.up, s.down))) * 1.15;
   const X = i => pad + i / (buf.length - 1) * (W - pad * 2);
@@ -1457,7 +1651,7 @@ function rateChartInto(box) {
   const area = key => `${path(key)}L${X(buf.length - 1).toFixed(1)},${H - pad}L${X(0).toFixed(1)},${H - pad}Z`;
   const grid = [0.25, 0.5, 0.75].map(f => `<line x1="0" x2="${W}" y1="${(H * f) | 0}" y2="${(H * f) | 0}" stroke="var(--border)" stroke-width="1"/>`).join('');
   const yLab = [0, 0.5, 1].map(f => `<text x="${pad}" y="${(H - pad - f * (H - pad * 2)) - 3}" font-size="9" fill="var(--text-3)" font-family="var(--mono)">${fmtRate(maxV * f)}</text>`).join('');
-  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="近 20 分钟下载与上传速率">
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="近 10 分钟下载与上传速率">
     ${grid}${yLab}
     <path d="${area('down')}" fill="var(--primary)" opacity=".10"/>
     <path d="${path('down')}" fill="none" stroke="var(--primary)" stroke-width="var(--seed-chart-weight)" vector-effect="non-scaling-stroke"/>
@@ -1488,6 +1682,7 @@ async function refreshLog(manual) {
       S.guardLog = gLines;
     }
     text = text.replace(/^#GUARD .*$/mg, '');
+    for (const ev of dnsWarnEvents(text)) notifPush(ev.lv, ev.b, ev.p);   // 1.7 DNS 失败进通知中心
     ingestLog(text);
     renderLogPage();
     if (S.page === 'proxies') renderGroups();      // 实际出口即刻反映
@@ -2471,7 +2666,7 @@ function updateNavState() {
 
 /* ================= 轮询 ================= */
 const POLL = [
-  { key: 'groups', period: () => S.cfg.groupSec * 1000, pages: null, run: () => refreshGroups(false) },
+  { key: 'groups', period: () => S.cfg.groupSec * 1000, pages: null, skipOn: ['overview'], run: () => refreshGroups(false) },
   { key: 'poll:general', period: () => 3000, pages: ['overview'], run: () => refreshGeneral() },
   { key: 'poll:log', period: () => S.cfg.logSec * 1000, pages: ['logs'], run: () => refreshLog(false) },
   { key: 'poll:logbg', period: () => Math.max(S.cfg.logSec, 10) * 1000, pages: null, run: () => { if (S.page !== 'logs') return refreshLog(false); } },
@@ -2490,6 +2685,7 @@ setInterval(() => {
   const now = Date.now();
   for (const p of POLL) {
     if (p.pages && !p.pages.includes(S.page)) continue;
+    if (p.skipOn && p.skipOn.includes(S.page)) continue; // 1.10 概览页的 groups 由概览批量查询承载
     if (now - (S.lastTs[p.key] || 0) < p.period()) continue;
     if (S.inflight.has(p.key)) continue;
     S.lastTs[p.key] = now;
@@ -2507,11 +2703,17 @@ async function boot() {
   if (runBtn) runBtn.addEventListener('click', cfgApply);
   const bell = $('#tb-bell');
   if (bell) bell.addEventListener('click', openDrawer);
-  await steerSyncFromServer().catch(() => {}); // 跨设备同步托管状态
+  // 1.4 首屏去阻塞：先渲染，跨设备托管状态同步改到后台并行
+  //（改动前 await 这条 ~47KB / 79ms 的 jsonStorage 读，首屏要等它回来才开始渲染）
   if (!location.hash) location.hash = '#/proxies';
   else onRoute();
   // 立即铺底数据（组 + 状态），页面自身也会拉
   refreshGroups(false);
   refreshGeneral();
+  // 同步完成后：重绘（托管 chips 依赖快照）+ 把本轮 groups 让给批量查询 + 补跑一次审计
+  steerSyncFromServer().then(() => {
+    ovGroupsTs = Date.now();
+    return refreshGroups(false);
+  }).then(() => steerAudit().catch(() => {})).catch(() => {});
 }
 ensureAuth().then(ok => { if (ok) boot(); });
