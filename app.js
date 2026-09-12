@@ -701,9 +701,9 @@ async function checkSteerHealth() {
   }
 }
 
-/* ================= 内存趋势（7 天） =================
+/* ================= 内存采样（供 KPI 卡 sparkline） =================
  * 采样来自出口记录 CGI 附带的 #MEM 行；≥30 分钟记一个点，保留 8 天。
- * 目的：把 daed 是否泄漏变成一条看得见的线。
+ * 搭 poll:logbg 的车，零额外请求；守卫动作走通知中心，不在此渲染大图。
  */
 function memHistLoad() {
   try { return JSON.parse(localStorage.getItem(MEMHIST_KEY)) || []; } catch { return []; }
@@ -717,30 +717,6 @@ function memHistSample() {
   while (arr.length && now - arr[0].t > 8 * 24 * 3600 * 1000) arr.shift();
   try { localStorage.setItem(MEMHIST_KEY, JSON.stringify(arr)); } catch {}
 }
-function drawMemTrend(box) {
-  if (!box) return;
-  const arr = memHistLoad().filter(p => p.kb > 0);
-  if (arr.length < 3) { box.innerHTML = '<div class="hint">内存趋势采样中（每 30 分钟一个点，1 天后出曲线）…</div>'; return; }
-  const W = 600, H = 60, pad = 3;
-  const vals = arr.map(p => p.kb);
-  const minV = Math.min(...vals) * 0.95, maxV = Math.max(...vals) * 1.05;
-  const t0 = arr[0].t, t1 = arr[arr.length - 1].t, span = Math.max(1, t1 - t0);
-  const X = t => pad + (t - t0) / span * (W - pad * 2);
-  const Y = v => H - pad - (v - minV) / Math.max(1, maxV - minV) * (H - pad * 2);
-  const path = arr.map((p, i) => `${i ? 'L' : 'M'}${X(p.t).toFixed(1)},${Y(p.kb).toFixed(1)}`).join('');
-  const mb = v => (v / 1024).toFixed(0);
-  const warnLine = 150 * 1024 >= minV && 150 * 1024 <= maxV
-    ? `<line x1="0" x2="${W}" y1="${Y(150 * 1024).toFixed(1)}" y2="${Y(150 * 1024).toFixed(1)}" stroke="rgba(248,113,113,.5)" stroke-dasharray="4 4" stroke-width="1"/>` : '';
-  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
-    <path d="${path}" fill="none" stroke="#38bdf8" stroke-width="1.5" vector-effect="non-scaling-stroke"/>${warnLine}
-  </svg>
-  <div class="hint" style="display:flex;justify-content:space-between">
-    <span>${new Date(t0).toLocaleDateString()} 起</span>
-    <span>最低 ${mb(minV)}MB · 当前 ${mb(vals[vals.length - 1])}MB · 峰值 ${mb(Math.max(...vals))}MB</span>
-    <span>红线 = 150MB</span>
-  </div>`;
-}
-
 /* ================= 图标 / 页面定义 ================= */
 const ICONS = {
   proxies: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 2 8l10 5 10-5-10-5Z"/><path d="m2 13 10 5 10-5"/></svg>',
@@ -1396,14 +1372,6 @@ function renderOverview() {
       </div>
     </section>
 
-    <section class="card span8">
-      <div class="card-head"><h2>内存可用趋势</h2><span class="sub">观察 daed 泄漏 · 每 30min 采样 · 保留 8 天</span>
-        <span class="spacer"></span>
-        <span class="legend"><span class="lg-mem"><i></i>MemAvailable</span><span class="lg-warn"><i></i>阈值 180MB</span><span class="lg-red"><i></i>红线 150MB</span></span></div>
-      <div class="chart-wrap" id="mem-chart"></div>
-      <div class="chart-axis"><span>${memTrendRange().t0}</span><span>守卫：连续 2 天 &lt;180MB 才重启</span><span>${memTrendRange().t1}</span></div>
-    </section>
-
     <section class="card span4">
       <div class="card-head"><h2>通知中心</h2><span class="tag ${notifUnread() ? 'err' : ''}">${notifUnread()} 条未读</span><span class="spacer"></span>
         <button class="btn btn-sm btn-ghost" id="ov-openbell">全部</button><button class="btn btn-sm btn-ghost" id="ov-markread">全部已读</button></div>
@@ -1431,9 +1399,10 @@ function renderOverview() {
       </div>`).join('')}
     </section>
 
-    <section class="card span4">
+    <section class="card span12">
       <div class="card-head"><h2>分组实际出口</h2><span class="spacer"></span><button class="btn btn-sm btn-ghost" data-nav="logs">出口记录 →</button></div>
-      <div class="card-pad" style="display:flex;flex-direction:column;gap:12px">
+      <div class="card-pad">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px">
         ${S.groups.map(gr => {
           const rec = recentFor(gr);
           const pred = predictFor(gr);
@@ -1453,12 +1422,12 @@ function renderOverview() {
           ${!fixed && pred ? `<div class="hint">预计出口 ${esc(pred.node.name)}（按延迟均值近似）</div>` : ''}
         </div>`;
         }).join('')}
-        <div class="hint" style="border-top:1px solid var(--border);padding-top:10px">真值来自连接日志 dialer 字段；直连/拦截流量不产生日志。</div>
+        </div>
+        <div class="hint" style="border-top:1px solid var(--border);margin-top:14px;padding-top:10px">真值来自连接日志 dialer 字段；直连/拦截流量不产生日志。</div>
       </div>
     </section>
   </div>`;
   rateChartInto($('#ov-chart'));
-  memChartInto($('#mem-chart'));
   const open = $('#ov-openbell');
   if (open) open.addEventListener('click', openDrawer);
   const mark = $('#ov-markread');
@@ -1475,12 +1444,6 @@ function sparkline(vals, color, w = 120, h = 30) {
   return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">
     <path d="${d}L${w},${h}L0,${h}Z" fill="${color}" opacity=".12"/>
     <path d="${d}" fill="none" stroke="${color}" stroke-width="1.4" vector-effect="non-scaling-stroke" opacity=".85"/></svg>`;
-}
-function memTrendRange() {
-  const arr = memHistLoad();
-  if (!arr.length) return { t0: '—', t1: '—' };
-  const f = t => new Date(t).toLocaleDateString().slice(5);
-  return { t0: f(arr[0].t), t1: f(arr[arr.length - 1].t) };
 }
 function rateChartInto(box) {
   if (!box) return;
@@ -1502,31 +1465,6 @@ function rateChartInto(box) {
     <path d="${path('up')}" fill="none" stroke="var(--success)" stroke-width="calc(var(--seed-chart-weight) * .85)" vector-effect="non-scaling-stroke"/>
   </svg>`;
 }
-function memChartInto(box) {
-  if (!box) return;
-  const arr = memHistLoad().filter(p => p.kb > 0);
-  if (arr.length < 3) { box.innerHTML = '<div class="hint" style="padding:16px">内存趋势采样中（每 30 分钟一个点，1 天后出曲线）…</div>'; return; }
-  const W = 600, H = 168, pad = 6;
-  const max = Math.max(320 * 1024, ...arr.map(p => p.kb)) * 1.05, min = Math.min(120 * 1024, ...arr.map(p => p.kb)) * 0.92;
-  const X = i => pad + i / (arr.length - 1) * (W - pad * 2);
-  const Y = v => H - pad - (v - min) / (max - min) * (H - pad * 2);
-  const d = arr.map((p, i) => `${i ? 'L' : 'M'}${X(i).toFixed(1)},${Y(p.kb).toFixed(1)}`).join('');
-  const redY = Y(150 * 1024).toFixed(1), warnY = Y(180 * 1024).toFixed(1);
-  const mb = v => (v / 1024).toFixed(0);
-  const dipIdx = arr.findIndex(p => p.kb < 180 * 1024);
-  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="内存可用趋势，阈值 180MB，红线 150MB">
-    <line x1="0" x2="${W}" y1="${redY}" y2="${redY}" stroke="var(--danger)" stroke-width="1" stroke-dasharray="4 4" opacity=".8"/>
-    <line x1="0" x2="${W}" y1="${warnY}" y2="${warnY}" stroke="var(--warning)" stroke-width="1" stroke-dasharray="4 4" opacity=".45"/>
-    <text x="${W - 4}" y="${redY - 4}" text-anchor="end" font-size="9" fill="var(--danger)" font-family="var(--mono)">红线 150MB</text>
-    <text x="${W - 4}" y="${warnY - 4}" text-anchor="end" font-size="9" fill="var(--warning)" font-family="var(--mono)">阈值 180MB</text>
-    <path d="${d}" fill="none" stroke="var(--primary)" stroke-width="var(--seed-chart-weight)" vector-effect="non-scaling-stroke"/>
-    ${dipIdx >= 0 ? `<circle cx="${X(dipIdx).toFixed(1)}" cy="${Y(arr[dipIdx].kb).toFixed(1)}" r="3.5" fill="var(--warning)" stroke="var(--surface)" stroke-width="1.5"/>
-    <text x="${(X(dipIdx) + 7).toFixed(1)}" y="${(Y(arr[dipIdx].kb) + 3).toFixed(1)}" font-size="9" fill="var(--warning)" font-family="var(--mono)">${mb(arr[dipIdx].kb)}MB · 守卫第一次确认</text>` : ''}
-    ${[0, Math.floor((arr.length - 1) / 2), arr.length - 1].map(i => `<text x="${X(i).toFixed(1)}" y="${H - 2}" font-size="9" fill="var(--text-3)" font-family="var(--mono)">${new Date(arr[i].t).toLocaleDateString().slice(5)}</text>`).join('')}
-    <text x="${pad}" y="14" font-size="9" fill="var(--text-3)" font-family="var(--mono)">MB</text>
-  </svg>`;
-}
-
 /* ================= 页面：出口记录 ================= */
 function cgiUrl() {
   try { const u = new URL(S.cfg.backend); return `http://${u.hostname}/cgi-bin/daed-board-log`; }

@@ -204,7 +204,6 @@ input, select, button, textarea { font: inherit; color: inherit; }
 .legend { display: flex; gap: 14px; font-size: 11.5px; color: var(--text-2); }
 .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
 .legend .lg-dl i { background: var(--primary); } .legend .lg-ul i { background: var(--success); }
-.legend .lg-mem i { background: var(--primary); } .legend .lg-red i { background: var(--danger); } .legend .lg-warn i { background: var(--warning); }
 
 /* ---- 状态区（键值列表） ---- */
 .state-list { display: flex; flex-direction: column; }
