@@ -1,8 +1,68 @@
 #!/bin/sh
-# daed-board 出口记录数据源：把 daed 连接日志尾部输出给前端解析。
+# daed-board 出口记录数据源（无状态增量版，2026-09-12）。
 # 部署位置：/www/cgi-bin/daed-board-log（需可执行权限）。
-# 首行附带路由器内存可用量（#MEM kb），供概览页监控长期运行状态。
-printf 'Content-Type: text/plain; charset=utf-8\r\n\r\n'
+#
+# 协议：客户端持游标 (inode, off)，服务端只读、**不落任何状态文件**。
+#   请求：  ?inode=<ino>&off=<bytes>[&reset=1]
+#   响应：  固定控制段 + 原始日志切片（按文件顺序）
+#     #MEM <kb>                                  内存可用（概览页 KPI）
+#     #GUARD <line>                              内存守卫日志（通知中心）
+#     #META inode=<> size=<> off=<> reset=<0|1>  本次切片起点 / 是否回填
+#   reset=1 = 这段是"最近 N 行回填"（首次、参数非法、日志轮换 inode 变、落后过多）。
+# 只回传完整行的裁剪由前端负责（按最后一个 \n 截断、余数留给下次读），
+# 这样服务端不必把整个切片读进变量（busybox ash 里没有好用的字节级裁剪工具）。
+LOG=/var/log/daed/daed.log
+BACKFILL_LINES=400      # 回填行数（实测 400 行 ≈ 108KB，可接受的一次性成本）
+MAX_CHUNK=131072        # 落后超过 128KB 就只回最后 128KB，避免一次拉满 1.7MB
+
+# 本机没有 stat：inode 用 ls -i 取，大小用 wc -c <（不要写 stat -c，会 command not found）
+INO=$(ls -i "$LOG" 2>/dev/null | awk '{print $1}')
+SIZE=$(wc -c < "$LOG" 2>/dev/null)
+
+printf 'Content-Type: text/plain; charset=utf-8\r\n'
+printf 'Cache-Control: no-store\r\n\r\n'
 awk '/MemAvailable/{print "#MEM " $2; exit}' /proc/meminfo 2>/dev/null
 tail -n 8 /tmp/daed-guard.log 2>/dev/null | sed 's/^/#GUARD /'
-tail -n 600 /var/log/daed/daed.log 2>/dev/null
+
+case "$INO" in ''|*[!0-9]*) INO=0 ;; esac
+case "$SIZE" in ''|*[!0-9]*) SIZE=0 ;; esac
+
+OFF=; CINO=; RESET=
+for kv in $(echo "$QUERY_STRING" | tr '&' ' '); do
+  case "$kv" in
+    off=*)   OFF=${kv#off=} ;;
+    inode=*) CINO=${kv#inode=} ;;
+    reset=*) RESET=1 ;;
+  esac
+done
+# 客户端给的值一律不信任：必须纯数字，且限制长度
+case "$OFF"  in ''|*[!0-9]*) OFF= ;; esac
+case "$CINO" in ''|*[!0-9]*) CINO= ;; esac
+[ -n "$OFF" ]  && [ ${#OFF}  -gt 12 ] && OFF=
+[ -n "$CINO" ] && [ ${#CINO} -gt 12 ] && CINO=
+
+START=0
+RESETFLAG=0
+if [ "$SIZE" -eq 0 ] || [ "$INO" -eq 0 ]; then
+  printf '#META inode=0 size=0 off=0 reset=1\n'
+  exit 0
+fi
+
+if [ -n "$RESET" ] || [ -z "$OFF" ] || [ "$CINO" != "$INO" ] || [ "$OFF" -gt "$SIZE" ]; then
+  BACK=$(tail -n $BACKFILL_LINES "$LOG" 2>/dev/null | wc -c)
+  START=$((SIZE - BACK))
+  [ "$START" -lt 0 ] && START=0
+  RESETFLAG=1
+elif [ $((SIZE - OFF)) -gt $MAX_CHUNK ]; then
+  START=$((SIZE - MAX_CHUNK))
+  [ "$START" -lt 0 ] && START=0
+  RESETFLAG=1
+else
+  START=$OFF
+fi
+
+printf '#META inode=%s size=%s off=%s reset=%s\n' "$INO" "$SIZE" "$START" "$RESETFLAG"
+if [ "$SIZE" -gt "$START" ]; then
+  tail -c +$((START + 1)) "$LOG" 2>/dev/null
+fi
+exit 0

@@ -67,7 +67,7 @@ const DEFAULT_CFG = {
   backend: '',   // 首次使用在登录页填写，如 http://192.168.1.1:2023（保存在浏览器）
   user: '', pass: '', remember: true,
   lowMs: 150, midMs: 350,
-  groupSec: 30, logSec: 5,
+  groupSec: 30, logSec: 3,
   hideUnavail: false, sort: 'default',
   filterMult: 0.2, filterKw: '剩余,到期,过期,官网,官址,重置,套餐,流量,有效', showJunk: false,
 };
@@ -93,6 +93,7 @@ const S = {
   closedGroups: new Set(JSON.parse(localStorage.getItem('db.closed') || '[]')),
   filter: '', logFilter: '', logOb: '', nodeFilter: '', nodeSub: '', memAvailKB: null,
   lastTs: {}, inflight: new Set(),
+  logCur: { inode: null, off: 0 },   // 3.2 出口记录增量游标：只放内存（多标签页天然隔离，重开页面走一次回填）
   authed: false,
 };
 function saveCfg() { localStorage.setItem(CFG_KEY, JSON.stringify(S.cfg)); }
@@ -1660,16 +1661,21 @@ function rateChartInto(box) {
   </svg>`;
 }
 /* ================= 页面：出口记录 ================= */
-function cgiUrl() {
-  try { const u = new URL(S.cfg.backend); return `http://${u.hostname}/cgi-bin/daed-board-log`; }
-  catch { return '/cgi-bin/daed-board-log'; }
+function cgiUrl(params) {
+  const q = params ? '?' + params.toString() : '';
+  try { const u = new URL(S.cfg.backend); return `http://${u.hostname}/cgi-bin/daed-board-log${q}`; }
+  catch { return `/cgi-bin/daed-board-log${q}`; }
 }
 let cgiWarned = false;
 async function refreshLog(manual) {
   if (S.inflight.has('log')) return;
   S.inflight.add('log');
   try {
-    const r = await fetchTimeout(cgiUrl(), {}, 10000);
+    // 3.2 增量读取：客户端持游标 (inode, off)，服务端不落状态文件
+    const p = new URLSearchParams();
+    if (manual || !S.logCur.inode) p.set('reset', '1');
+    else { p.set('inode', S.logCur.inode); p.set('off', S.logCur.off); }
+    const r = await fetchTimeout(cgiUrl(p), {}, 10000);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     let text = await r.text();
     const mem = /^#MEM\s+(\d+)/m.exec(text);
@@ -1682,6 +1688,19 @@ async function refreshLog(manual) {
       S.guardLog = gLines;
     }
     text = text.replace(/^#GUARD .*$/mg, '');
+    // #META：本次切片的起点与"是否回填"；据此推进游标
+    const meta = /^#META inode=(\d+) size=(\d+) off=(\d+) reset=(\d)/m.exec(text);
+    if (meta) {
+      // 从 #META 那一行的换行之后开始算日志体（CGI 保证 #META 是控制段的最后一行）。
+      // 注意不要用 replace(/^#META .*$/mg,'')：那样会留下该行的换行符，
+      // 被算进游标就会让偏移多 1 字节 → 下一批的第一行被截断丢掉。
+      text = text.slice(text.indexOf('\n', meta.index) + 1);
+      // 只消费到最后一个换行：末尾若是不完整的行，就留给下次读（否则会把半行喂给解析器）
+      const nl = text.lastIndexOf('\n');
+      const consumed = nl === -1 ? '' : text.slice(0, nl + 1);
+      // dialer 里带 emoji：JS 的 String.length 是 UTF-16 码元数 ≠ 字节数，必须用 TextEncoder 计字节
+      S.logCur = { inode: +meta[1], off: (+meta[3]) + new TextEncoder().encode(consumed).length };
+    }
     for (const ev of dnsWarnEvents(text)) notifPush(ev.lv, ev.b, ev.p);   // 1.7 DNS 失败进通知中心
     ingestLog(text);
     renderLogPage();
