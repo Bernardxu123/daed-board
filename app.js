@@ -272,7 +272,6 @@ function ingestLog(text) {
 }
 /* 1.7 DNS 上游失败 → 通知中心。
  * parseLogLine 只收 INFO 行，WARN 被整段丢弃，于是"某次网站打不开"只留在日志里没人看见。
- * key 由 notifPush 按 lv|b|p 去重，所以这里**不带时间戳**（否则同一次故障每次轮询都会新增一条）；
  * 同一域名在一轮里只出一条，hard（真的发了 SERVFAIL）优先。 */
 function qnameFromDohB64(b64) {
   try {
@@ -870,68 +869,6 @@ setInterval(() => {
   if (t) { const d = new Date(); t.textContent = [d.getHours(), d.getMinutes(), d.getSeconds()].map(x => String(x).padStart(2, '0')).join(':'); }
 }, 1000);
 
-/* ================= 通知中心（真数据） ================= */
-const NOTIF_KEY = 'db.notifs';
-function notifLoad() { try { const a = JSON.parse(localStorage.getItem(NOTIF_KEY) || '[]'); return Array.isArray(a) ? a.slice(0, 50) : []; } catch { return []; } }
-function notifSave(a) { try { localStorage.setItem(NOTIF_KEY, JSON.stringify(a.slice(0, 50))); } catch {} }
-function notifPush(lv, b, p) {
-  const arr = notifLoad();
-  const key = lv + '|' + b + '|' + p;
-  if (arr.some(x => x.key === key)) return;
-  const d = new Date();
-  arr.unshift({ key, lv, b, p, t: `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`, read: false });
-  notifSave(arr);
-  updateBell();
-}
-function notifUnread() { return notifLoad().filter(x => !x.read).length; }
-function updateBell() {
-  const bdg = $('#bell-bdg');
-  if (!bdg) return;
-  const n = notifUnread();
-  bdg.hidden = n === 0;
-  bdg.textContent = String(n);
-}
-function notifDerived() {
-  const run = S.general && S.general.dae;
-  if (run && run.modified) notifPush('warn', '配置有改动未应用', '点击顶栏「应用改动 (run)」重载生效（代理瞬断 1-2 秒）');
-  const dead = [];
-  for (const g of S.groups) for (const n of (g.pool || g.nodes || [])) {
-    const l = S.lat.get(n.id);
-    if (l && !l.alive && l.testedAt) dead.push(n.name + (l.message ? '（' + String(l.message).slice(0, 42) + '）' : ''));
-  }
-  if (dead.length) notifPush('err', `${dead.length} 个节点不可用`, dead.slice(0, 3).join('、') + (dead.length > 3 ? ' 等' : ''));
-  for (const s of S.subs || []) {
-    if (s.cronEnable && s.cronExp) notifPush('info', `订阅「${s.tag || s.id}」定时 ${s.cronExp}`, `节点 ${s.nodes && s.nodes.totalCount != null ? s.nodes.totalCount : '—'} 个`);
-  }
-}
-function openDrawer() {
-  const root = $('#drawer-root');
-  if (!root) return;
-  const arr = notifLoad();
-  root.innerHTML = `
-  <div class="drawer-mask" id="dw-mask"></div>
-  <aside class="drawer" role="dialog" aria-label="通知中心">
-    <div class="dh"><b>通知中心</b><span class="tag ${notifUnread() ? 'err' : ''}" id="dw-unread">${notifUnread()} 条未读</span><span class="spacer" style="flex:1"></span>
-      <button class="btn btn-sm" id="dw-read">全部已读</button><button class="icon-btn" id="dw-close" aria-label="关闭">✕</button></div>
-    <div class="db"><div class="notif">
-      ${arr.length ? arr.map(n => `
-        <div class="notif-item ${n.lv}">
-          ${!n.read ? '<span class="unread-dot" aria-hidden="true"></span>' : ''}
-          <div class="nt"><b>${esc(n.b)}</b><p>${esc(n.p)}</p></div><span class="ts">${esc(n.t)}</span>
-        </div>`).join('') : '<div class="empty">暂无通知</div>'}
-    </div></div>
-  </aside>`;
-  const close = () => { root.innerHTML = ''; };
-  $('#dw-mask').addEventListener('click', close);
-  $('#dw-close').addEventListener('click', close);
-  $('#dw-read').addEventListener('click', () => {
-    notifSave(notifLoad().map(x => ({ ...x, read: true })));
-    updateBell();
-    close();
-    toast('已全部标记为已读', 'ok');
-  });
-}
-
 /* ================= 页面：代理 ================= */
 function pageProxies(el) {
   el.innerHTML = `
@@ -1009,15 +946,20 @@ function applyGroupsPayload(groups, lats) {
   steerAudit().catch(() => {});
   if (S.page === 'logs') renderLogPage();
   updateNavState();
-  notifDerived();
 }
-async function refreshGroups(manual) {
+async function refreshGroups(manual, opts) {
   if (S.inflight.has('groups')) return;
   S.inflight.add('groups');
+  const skipLat = !!(opts && opts.skipLat);
   try {
     const gs = (await api.groups()) || [];
     const ids = [...new Set(gs.flatMap(g => buildPool(g).map(n => n.id)))];
-    applyGroupsPayload(gs, ids.length ? await api.latencies(ids) : []);
+    if (skipLat) {
+      applyGroupsPayload(gs, []);
+      if (ids.length) api.latencies(ids).then(lats => { applyLatencies(lats || []); if (S.page === 'proxies') renderGroups(); }).catch(() => {});
+    } else {
+      applyGroupsPayload(gs, ids.length ? await api.latencies(ids) : []);
+    }
     if (manual) toast('已刷新', 'ok');
   } catch (e) {
     if (e instanceof AuthError) return handleAuthError();
@@ -1282,17 +1224,29 @@ async function addNodesModal(g) {
   const ids = Object.keys(out).filter(k => out[k]);
   if (!ids.length) return toast('未勾选任何节点', 'err');
   const needPolicy = g.policy === 'fixed';
+  // 乐观更新：先把节点并进本地组并重绘
+  const byId = new Map((S.nodesAll || []).map(n => [n.id, n]));
+  const have = new Set((g.nodes || []).map(n => n.id));
+  for (const id of ids) {
+    const n = byId.get(id);
+    if (n && !have.has(id)) { (g.nodes = g.nodes || []).push(n); have.add(id); }
+  }
+  if (needPolicy) g.policy = 'min_avg10';
+  buildPool(g);
+  if (S.page === 'proxies') renderGroups();
   try {
     if (st) { const all = steerLoadAll(); delete all[g.id]; await steerPersist(all); }
     await api.addNodes(g.id, ids);
     if (needPolicy) await api.setPolicy(g.id, 'min_avg10', []);
-    await api.run();
+    api.run().catch(() => toast('run 失败：配置可能未生效，请点顶栏「应用改动」', 'err'));
     toast(`已添加 ${ids.length} 个节点到「${g.name}」${st ? '（已退出钉选）' : ''}${needPolicy ? '，fixed 多节点受限已自动切换 min_avg10' : ''}`, 'ok');
   } catch (e) {
     if (e instanceof AuthError) return handleAuthError();
     toast('添加失败：' + e.message, 'err');
+    refreshGroups(true);
+    return;
   }
-  loadGroups();
+  setTimeout(() => refreshGroups(false), 0);
 }
 async function delNodeAction(nodeId) {
   const n = S.nodesAll.find(x => x.id === nodeId) ||
@@ -1300,15 +1254,29 @@ async function delNodeAction(nodeId) {
   const name = n ? n.name : nodeId;
   if (!(await showConfirm(
     `确定从 daed 删除节点「<b>${esc(name)}</b>」？<br><span style="color:var(--yellow)">所在分组的成员会自动同步移除；订阅里的节点可能被订阅更新重新导入。</span>`))) return;
+  // 乐观更新：立刻从本地列表消失，失败再回源回滚
+  S.nodesAll = (S.nodesAll || []).filter(x => x.id !== nodeId);
+  for (const g of S.groups) {
+    if (g.nodes) g.nodes = g.nodes.filter(x => x.id !== nodeId);
+    if (g.pool) g.pool = g.pool.filter(x => x.id !== nodeId);
+  }
+  S.lat.delete(nodeId);
+  if (S.page === 'proxies') renderGroups();
+  else if (S.page === 'nodes') renderNodesTable();
   try {
     await api.removeNodesBatch([nodeId]);
     toast(`已删除「${name}」`, 'ok');
   } catch (e) {
     if (e instanceof AuthError) return handleAuthError();
     toast('删除失败：' + e.message, 'err');
+    if (S.page === 'proxies') refreshGroups(true);
+    else if (S.page === 'nodes') refreshNodesPage(true);
+    return;
   }
-  if (S.page === 'proxies') loadGroups();
-  else if (S.page === 'nodes') refreshNodesPage(false);
+  setTimeout(() => {
+    if (S.page === 'proxies') refreshGroups(false);
+    else if (S.page === 'nodes') refreshNodesPage(false);
+  }, 0);
 }
 function renderNodesTable() {
   if (S.page !== 'nodes') return;
@@ -1366,8 +1334,7 @@ async function refreshGeneral() {
     if (d.groups) applyGroupsPayload(d.groups, d.nodeLatencies);            // 1.10 与速率同一往返返回
     renderOverview();
     updateNavState();
-    notifDerived();
-  } catch (e) {
+    } catch (e) {
     if (e instanceof AuthError) return handleAuthError();
   } finally { S.inflight.delete('general'); }
 }
@@ -1424,7 +1391,7 @@ function ovModel() {
     { st: 'idle', icon: '⚡', name: '场景预设', tags: ['日常模式'], m: '设置页一键切换托管/策略/日志组合', acts: [{ n: '去设置', nav: 'settings' }] },
   ];
   return { g, ov, upNow, downNow, upInstant, downInstant, dlSpark, ulSpark, memSpark, memMB,
-           aliveN, totalN, cfg, notifs: notifLoad(), guardTail, tasks, ax };
+           aliveN, totalN, cfg, guardTail, tasks, ax };
 }
 /* 结构键：只有会改变元素「集合 / 顺序」的东西才进来；纯数值变化交给 ovUpdate() 定点更新。
  * 改动前每次 3s 轮询都重建整页 innerHTML → 闪烁、丢滚动位置与展开态、手机端掉帧。 */
@@ -1436,14 +1403,13 @@ function ovStructKey() {
       gr.policy === 'fixed' && fixedNodeFor(gr) ? fixedNodeFor(gr).id : '-'].join('|')).join(','),
     (S.subs || []).map(s => [s.id, s.cronEnable ? 1 : 0, s.nodes && s.nodes.totalCount].join('|')).join(','),
     (S.guardLog || []).length,
-    notifLoad().slice(0, 6).map(n => [n.lv, n.b, n.p, n.t].join('|')).join(','),
     g.dae ? [g.dae.running, g.dae.modified, g.dae.version].join('|') : '',
     cfg.dialMode, cfg.logLevel, cfg.checkInterval, cfg.checkTolerance,
   ].join('~');
 }
 function ovHtml(m) {
   const { g, ov, upNow, downNow, dlSpark, ulSpark, memSpark, memMB,
-          aliveN, totalN, cfg, notifs, tasks, ax } = m;
+          aliveN, totalN, cfg, tasks, ax } = m;
   return `
   <div class="kpi-grid">
     <div class="card kpi"><div class="lbl">下载速率</div>
@@ -1492,15 +1458,28 @@ function ovHtml(m) {
       </div>
     </section>
 
+    <section class="card span8">
+      <div class="card-head"><h2>实时速率</h2><span class="sub">来源 runtimeOverview 采样</span>
+        <span class="spacer"></span>
+        <span class="legend"><span class="lg-dl"><i></i>下载</span><span class="lg-ul"><i></i>上传</span></span></div>
+      <div class="chart-meta"><span class="big pdn" id="ov-big-dl">${fmtRate(downNow)}<i>下载</i></span><span class="big pub" id="ov-big-ul">${fmtRate(upNow)}<i>上传</i></span>
+        <span class="hint" id="ov-updated">更新于 ${hhmm(parseTime(ov.updatedAt)) || '—'}</span></div>
+      <div class="chart-wrap" id="ov-chart"></div>
+      <div class="chart-axis"><span id="ax-start">${ax.start}</span><span id="ax-peak">峰值 ${ax.peak}</span><span id="ax-end">${ax.end}</span></div>
+    </section>
+
     <section class="card span4">
-      <div class="card-head"><h2>通知中心</h2><span class="tag ${notifUnread() ? 'err' : ''}" id="ov-notif-tag">${notifUnread()} 条未读</span><span class="spacer"></span>
-        <button class="btn btn-sm btn-ghost" id="ov-openbell">全部</button><button class="btn btn-sm btn-ghost" id="ov-markread">全部已读</button></div>
-      <div class="notif">
-        ${notifs.length ? notifs.slice(0, 6).map(n => `
-        <div class="notif-item ${n.lv}">
-          ${!n.read ? '<span class="unread-dot" aria-hidden="true"></span>' : ''}
-          <div class="nt"><b>${esc(n.b)}</b><p>${esc(n.p)}</p></div><span class="ts">${esc(n.t)}</span>
-        </div>`).join('') : '<div class="empty">暂无通知</div>'}
+      <div class="card-head"><h2>系统状态</h2><span class="spacer"></span><button class="btn btn-sm btn-ghost" data-nav="config">配置 →</button></div>
+      <div class="state-list">
+        ${[
+          { k: '运行状态', v: g.dae.running ? '运行中' : '已停止', tag: g.dae.running ? 'ok' : 'err' },
+          { k: '核心版本', v: g.dae.version || '—' },
+          { k: '配置状态', v: g.dae.modified ? '有改动未应用' : '已生效', tag: g.dae.modified ? 'warn' : 'ok' },
+          { k: '拨号模式', v: cfg.dialMode || '—' },
+          { k: '日志级别', v: cfg.logLevel || '—' },
+          { k: '测速间隔', v: (cfg.checkInterval || '—') + ' / 容差 ' + (cfg.checkTolerance || '—') },
+          { k: '内存可用', v: memMB != null ? memMB + ' MB' : '—', tag: memMB != null && memMB < 180 ? 'warn' : 'ok' },
+        ].map((s, i) => `<div class="state-row"><span class="k">${esc(s.k)}</span><span class="v" id="stv-${i}" title="${esc(s.v)}">${esc(s.v)}</span>${s.tag ? `<span class="tag ${s.tag}" id="stt-${i}">${s.tag === 'ok' ? '正常' : s.tag === 'warn' ? '注意' : '停止'}</span>` : ''}</div>`).join('')}
       </div>
     </section>
 
@@ -1544,12 +1523,7 @@ function ovHtml(m) {
     </section>
   </div>`;
 }
-function bindOverviewEvents() {
-  const open = $('#ov-openbell');
-  if (open) open.addEventListener('click', openDrawer);
-  const mark = $('#ov-markread');
-  if (mark) mark.addEventListener('click', () => { notifSave(notifLoad().map(x => ({ ...x, read: true }))); updateBell(); renderOverview(); toast('已全部标记为已读', 'ok'); });
-}
+function bindOverviewEvents() {}
 /* 1.9 数值层：只写需要变的节点，不重建 DOM */
 function ovUpdate(m) {
   const { ov, upNow, downNow, upInstant, downInstant, dlSpark, ulSpark, memSpark, memMB,
@@ -1600,8 +1574,6 @@ function ovUpdate(m) {
     if (t) t.className = 'tag ' + (s.tag || '');
   });
 
-  const ntag = el('ov-notif-tag');
-  if (ntag) { ntag.textContent = `${notifUnread()} 条未读`; ntag.className = 'tag ' + (notifUnread() ? 'err' : ''); }
 
   // 定时任务行的相对时间
   m.tasks.forEach((t, i) => txt(`task-m-${i}`, t.m));
@@ -1684,7 +1656,6 @@ async function refreshLog(manual) {
     const gLines = text.split(String.fromCharCode(10)).filter(l => l.startsWith('#GUARD ')).map(l => l.slice(7).trim());
     if (gLines.length !== (S.guardLog || []).length || gLines.some((l, i2) => l !== (S.guardLog || [])[i2])) {
       const known = new Set(S.guardLog || []);
-      for (const gl of gLines) if (!known.has(gl)) notifPush(/restart/.test(gl) ? 'warn' : 'info', '内存守卫 daed-guard', gl);
       S.guardLog = gLines;
     }
     text = text.replace(/^#GUARD .*$/mg, '');
@@ -1701,7 +1672,6 @@ async function refreshLog(manual) {
       // dialer 里带 emoji：JS 的 String.length 是 UTF-16 码元数 ≠ 字节数，必须用 TextEncoder 计字节
       S.logCur = { inode: +meta[1], off: (+meta[3]) + new TextEncoder().encode(consumed).length };
     }
-    for (const ev of dnsWarnEvents(text)) notifPush(ev.lv, ev.b, ev.p);   // 1.7 DNS 失败进通知中心
     ingestLog(text);
     renderLogPage();
     if (S.page === 'proxies') renderGroups();      // 实际出口即刻反映
@@ -2720,14 +2690,12 @@ async function boot() {
   S.lastTs = {};
   const runBtn = $('#tb-run');
   if (runBtn) runBtn.addEventListener('click', cfgApply);
-  const bell = $('#tb-bell');
-  if (bell) bell.addEventListener('click', openDrawer);
   // 1.4 首屏去阻塞：先渲染，跨设备托管状态同步改到后台并行
   //（改动前 await 这条 ~47KB / 79ms 的 jsonStorage 读，首屏要等它回来才开始渲染）
   if (!location.hash) location.hash = '#/proxies';
   else onRoute();
-  // 立即铺底数据（组 + 状态），页面自身也会拉
-  refreshGroups(false);
+  // 首屏减负：先只拉 groups（不阻塞全量 latencies），延迟后台补齐
+  refreshGroups(false, { skipLat: true });
   refreshGeneral();
   // 同步完成后：重绘（托管 chips 依赖快照）+ 把本轮 groups 让给批量查询 + 补跑一次审计
   steerSyncFromServer().then(() => {

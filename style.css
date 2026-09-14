@@ -218,20 +218,6 @@ input, select, button, textarea { font: inherit; color: inherit; }
 .tag.err { color: var(--danger); border-color: var(--danger-line); background: var(--danger-soft); }
 .tag.p { color: var(--primary); border-color: var(--primary-line); background: var(--primary-soft); }
 
-/* ---- 通知中心 ---- */
-.notif { display: flex; flex-direction: column; max-height: 400px; overflow: auto; }
-.notif-item { display: flex; gap: 10px; padding: 11px 16px; border-bottom: 1px solid color-mix(in srgb, var(--seed-fg) 6%, transparent); position: relative; }
-.notif-item:last-child { border-bottom: 0; }
-.notif-item::before { content: ""; position: absolute; left: 0; top: 8px; bottom: 8px; width: 2.5px; border-radius: 2px; background: var(--text-3); }
-.notif-item.err::before { background: var(--danger); }
-.notif-item.warn::before { background: var(--warning); }
-.notif-item.ok::before { background: var(--success); }
-.notif-item.info::before { background: var(--primary); }
-.notif-item .nt { flex: 1; min-width: 0; }
-.notif-item .nt b { display: block; font-size: 12.5px; font-weight: 600; margin-bottom: 1px; }
-.notif-item .nt p { margin: 0; font-size: 11.5px; color: var(--text-2); }
-.notif-item .ts { font: 10.5px/1.6 var(--mono); color: var(--text-3); flex: none; }
-.unread-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--danger); flex: none; margin-top: 6px; }
 
 /* ---- 任务列表 ---- */
 .task { display: flex; align-items: center; gap: 12px; padding: 11px 16px; border-bottom: 1px solid color-mix(in srgb, var(--seed-fg) 6%, transparent); }
