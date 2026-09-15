@@ -67,7 +67,7 @@ const DEFAULT_CFG = {
   backend: '',   // 首次使用在登录页填写，如 http://192.168.1.1:2023（保存在浏览器）
   user: '', pass: '', remember: true,
   lowMs: 150, midMs: 350,
-  groupSec: 30, logSec: 3,
+  groupSec: 30, logSec: 3, retestSec: 90,
   hideUnavail: false, sort: 'default',
   filterMult: 0.2, filterKw: '剩余,到期,过期,官网,官址,重置,套餐,流量,有效', showJunk: false,
 };
@@ -191,8 +191,10 @@ const api = {
   getStorage: async paths => (await gql(`query($p:[String!]){ jsonStorage(paths:$p) }`, { p: paths })).jsonStorage,
   setStorage: (paths, values) => gql(`mutation($p:[String!]!,$v:[String!]!){ setJsonStorage(paths:$p, values:$v) }`, { p: paths, v: values }),
   // 订阅/节点管理（P1）—— 均已在 api 层拆掉 GraphQL data 信封
+  // 注意：SubscriptionImportResult 无顶层 error 字段（拉取失败走 GraphQL errors）；
+  // NodeImportResult 才有 error。写错会 import 必败。
   importSub: async (link, tag) => (await gql(`mutation($rb:Boolean!,$arg:ImportArgument!){ importSubscription(rollbackError:$rb, arg:$arg){
-      link error sub { id tag status updatedAt info cronExp cronEnable nodes { totalCount } }
+      link sub { id tag status updatedAt info cronExp cronEnable nodes { totalCount } }
       nodeImportResult { link error node { id name } } } }`, { rb: false, arg: { link, tag } }, 120000)).importSubscription,
   updateSub: async id => (await gql(`mutation($id:ID!){ updateSubscription(id:$id){ id tag status updatedAt info nodes { totalCount } } }`, { id }, 120000)).updateSubscription,
   updateSubLink: async (id, link) => (await gql(`mutation($id:ID!,$link:String!){ updateSubscriptionLink(id:$id, link:$link){ id tag } }`, { id, link })).updateSubscriptionLink,
@@ -2169,6 +2171,7 @@ async function pageSettings(el) {
       <div class="form-row">
         <label style="flex:1">代理页刷新间隔 (秒)<input id="st-groupsec" type="number" min="5" value="${S.cfg.groupSec}"></label>
         <label style="flex:1">日志刷新间隔 (秒)<input id="st-logsec" type="number" min="3" value="${S.cfg.logSec}"></label>
+        <label style="flex:1">组节点自动测速 (秒，0=关)<input id="st-retest" type="number" min="0" value="${S.cfg.retestSec}"></label>
       </div>
       <div class="form-row">
         <label style="flex:1">屏蔽倍率 ≤ (0=不屏蔽)<input id="st-fmult" type="number" step="0.1" min="0" value="${S.cfg.filterMult}"></label>
@@ -2202,6 +2205,7 @@ async function pageSettings(el) {
     S.cfg.midMs = Number($('#st-mid').value) || 350;
     S.cfg.groupSec = Math.max(5, Number($('#st-groupsec').value) || 30);
     S.cfg.logSec = Math.max(3, Number($('#st-logsec').value) || 5);
+    S.cfg.retestSec = Math.max(0, Number($('#st-retest').value) || 0);
     S.cfg.filterMult = Math.max(0, Number($('#st-fmult').value) || 0);
     S.cfg.filterKw = $('#st-fkw').value.trim() || DEFAULT_CFG.filterKw;
     saveCfg();
@@ -2650,7 +2654,6 @@ function updateNavState() {
   if (av && g) av.textContent = 'dae ' + (g.dae.version || '') + (g.dae.modified ? ' · 有改动未应用' : '');
   renderNav();
   topChips();
-  updateBell();
 }
 
 /* ================= 轮询 ================= */
@@ -2667,6 +2670,12 @@ const POLL = [
     const ids = [...new Set(S.groups.flatMap(g => (g.pool || g.nodes).map(n => n.id)).concat(extra))];
     if (ids.length) { try { applyLatencies(await api.latencies(ids)); } catch {} }
     try { await checkSteerHealth(); } catch {}
+  } },
+  // 面板侧主动重测组池：daed 内核 checkInterval 默认约 3m，这里可更密（默认 90s；0=关闭）
+  { key: 'poll:retest', period: () => (S.cfg.retestSec > 0 ? S.cfg.retestSec * 1000 : Infinity), pages: null, run: async () => {
+    if (!(S.cfg.retestSec > 0) || S.testing.size) return;
+    const ids = [...new Set(S.groups.flatMap(g => (g.pool || g.nodes || []).map(n => n.id)))];
+    if (ids.length) await testNodes(ids);
   } },
 ];
 setInterval(() => {
