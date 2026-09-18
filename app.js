@@ -82,7 +82,8 @@ const S = {
   lat: new Map(),        // id -> {latencyMs, alive, testedAt, message}
   hist: new Map(),       // id -> [ms,...] 最近≤10 次测速值（面板自采样）
   histTs: new Map(),     // id -> 上次已入史的 testedAt
-  subTagMap: new Map(),  // subscriptionId -> tag（节点卡显示来源）
+  subTagMap: new Map(),  // subscriptionId -> tag
+  nodeSubTag: new Map(), // nodeId -> 订阅 tag（托管拆成显式节点后仍可显示来源）
   general: null,
   ovBuf: [],             // [{ts, up, down}] 合并后的速率采样序列
   logEntries: [],
@@ -692,8 +693,10 @@ async function fetchAllSubNodes() {
   const out = [];
   for (const s of d.subscriptions || []) {
     noteSubTags([s]);
+    if (s.id && s.tag) S.subTagMap.set(s.id, s.tag);
     for (const e of (s.nodes && s.nodes.edges) || []) {
       out.push({ ...e, subTag: s.tag || '' });
+      if (e && e.id) S.nodeSubTag.set(e.id, s.tag || '');
     }
   }
   return out;
@@ -992,7 +995,23 @@ function noteSubTags(list) {
   }
 }
 function subTagOf(n) {
-  return n.subTag || (n.subscriptionID && S.subTagMap.get(n.subscriptionID)) || '';
+  return n.subTag
+    || (n.id && S.nodeSubTag.get(n.id))
+    || (n.subscriptionID && S.subTagMap.get(n.subscriptionID))
+    || '';
+}
+/** 全局 nodeId→订阅tag 索引：托管时组内订阅被拆掉，卡片来源不能只靠 g.subscriptions */
+async function syncSubTagIndex() {
+  try {
+    const d = await gql(`query { subscriptions { id tag nodes(first: 999) { edges { id subscriptionID } } } }`);
+    for (const s of d.subscriptions || []) {
+      if (s.id && s.tag) S.subTagMap.set(s.id, s.tag);
+      for (const e of (s.nodes && s.nodes.edges) || []) {
+        if (e && e.id) S.nodeSubTag.set(e.id, s.tag || '');
+      }
+    }
+    return true;
+  } catch { return false; }
 }
 function buildPool(g) {
   noteSubTags((g.subscriptions || []).map(s => s.subscription));
@@ -1015,6 +1034,8 @@ function applyGroupsPayload(groups, lats) {
   const keep = (lats || []).filter(l => pool.has(l.id));
   if (keep.length) applyLatencies(keep);
   renderGroups();
+  // 托管组节点是显式成员：后台补全 nodeId→订阅tag，下次重绘卡片会带来源
+  syncSubTagIndex().then(ok => { if (ok && S.page === 'proxies') renderGroups(); }).catch(() => {});
   steerAudit().catch(() => {});
   if (S.page === 'logs') renderLogPage();
   updateNavState();
@@ -2776,6 +2797,7 @@ async function boot() {
   if (!location.hash) location.hash = '#/proxies';
   else onRoute();
   // 首屏减负：先只拉 groups（不阻塞全量 latencies），延迟后台补齐
+  syncSubTagIndex().then(() => { if (S.page === 'proxies') renderGroups(); }).catch(() => {});
   refreshGroups(false, { skipLat: true });
   refreshGeneral();
   // 同步完成后：重绘（托管 chips 依赖快照）+ 把本轮 groups 让给批量查询 + 补跑一次审计
