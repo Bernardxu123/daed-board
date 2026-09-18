@@ -292,6 +292,7 @@ input, select, button, textarea { font: inherit; color: inherit; }
 .node-card .nn { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; }
 .node-card.add-card { justify-content: center; align-items: center; border-style: dashed; color: var(--text-3); min-height: 74px; }
 .proto { font-size: 9.5px; padding: 1px 6px; border-radius: 5px; flex: none; background: var(--surface-2); color: var(--text-2); border: 1px solid var(--border); text-transform: uppercase; letter-spacing: .04em; }
+.n-sub { font-size: 10px; color: var(--text-3); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lat { align-self: flex-start; font: 11.5px/1 var(--mono); padding: 4px 9px; border-radius: 99px; background: var(--surface-2); color: var(--text-2); border: 1px solid var(--border); }
 .lat.l1 { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-line); }
 .lat.l2 { color: var(--warning); background: var(--warning-soft); border-color: var(--warning-line); }

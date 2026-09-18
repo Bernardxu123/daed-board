@@ -82,6 +82,7 @@ const S = {
   lat: new Map(),        // id -> {latencyMs, alive, testedAt, message}
   hist: new Map(),       // id -> [ms,...] 最近≤10 次测速值（面板自采样）
   histTs: new Map(),     // id -> 上次已入史的 testedAt
+  subTagMap: new Map(),  // subscriptionId -> tag（节点卡显示来源）
   general: null,
   ovBuf: [],             // [{ts, up, down}] 合并后的速率采样序列
   logEntries: [],
@@ -619,6 +620,12 @@ async function steerTo(g, regionId, opts) {
     all[g.id] = {
       mode: 'region', region: regionId, pinnedName: undefined, targetIds,
       backup,
+      // 记录托管时的订阅引用：订阅更新后审计按此从订阅池重新筛区域节点
+      subRefs: (g.subscriptions || []).map(s => ({
+        id: s.subscription && s.subscription.id,
+        tag: (s.subscription && s.subscription.tag) || '',
+        filter: s.nameFilterRegex || null,
+      })).filter(x => x.id),
       addedIds: targetIds.filter(id => !backup.explicitIds.includes(id)),
       savedPolicy: st.savedPolicy,
       lastAuto: st.lastAuto || 0,
@@ -680,6 +687,18 @@ async function nodeIndex() {
   return { alive, byName, mk };
 }
 
+async function fetchAllSubNodes() {
+  const d = await gql(`query { subscriptions { id tag nodes(first: 999) { edges { id name address protocol tag subscriptionID } } } }`);
+  const out = [];
+  for (const s of d.subscriptions || []) {
+    noteSubTags([s]);
+    for (const e of (s.nodes && s.nodes.edges) || []) {
+      out.push({ ...e, subTag: s.tag || '' });
+    }
+  }
+  return out;
+}
+
 async function steerAudit() {
   if (steerBusy) return;
   // 1.5 只读本地快照：跨设备同步改在启动时做一次
@@ -692,6 +711,7 @@ async function steerAudit() {
   let idx = null;
   try { idx = await nodeIndex(); } catch { return; }
   const remapOf = st => idx.mk(st.backup);
+  let liveSubNodes = null;
   for (const gid of gids) {
     const g = S.groups.find(x => x.id === gid);
     if (!g) { delete all[gid]; changed = true; continue; } // 组已被删除
@@ -715,11 +735,46 @@ async function steerAudit() {
     st.targetIds = dedupe((st.targetIds || []).map(remap).filter(Boolean));
     st.addedIds = dedupe((st.addedIds || []).map(remap).filter(Boolean));
     if (snapOf(st) !== before) changed = true;
-    // 掉员修复：托管目标节点被订阅更新等移除时补回
-    const curIds = new Set(g.nodes.map(n => n.id));
-    const missing = st.targetIds.filter(id => !curIds.has(id));
-    if (missing.length) {
-      try { await api.addNodes(gid, missing); await api.run(); toast(`「${g.name}」托管节点缺失 ${missing.length} 个，已自动补齐`, 'ok'); } catch {}
+    // 区域托管：订阅更新后从**当前订阅池**按区域重算目标（旧逻辑只补“名字还在”的旧 id，
+    // 订阅删旧建新 + 新增同区域节点时永远进不了托管组）
+    if (st.mode === 'region' && st.region) {
+      if (!liveSubNodes) {
+        try { liveSubNodes = await fetchAllSubNodes(); } catch { liveSubNodes = []; }
+      }
+      const regionId = st.region;
+      const subIds = new Set((st.subRefs || []).map(s => s.id).filter(Boolean)
+        .concat((st.backup.subs || []).map(s => s.id).filter(Boolean)));
+      // 备用：未记录 subRefs 的旧快照 → 全订阅池按区域筛
+      const fromSubs = liveSubNodes.filter(n =>
+        (!subIds.size || subIds.has(n.subscriptionID)) &&
+        regionOf(n) === regionId && !isJunk(n));
+      const fromGroup = (g.nodes || []).filter(n => regionOf(n) === regionId && !isJunk(n));
+      const nextIds = dedupe(fromSubs.concat(fromGroup).map(n => n.id));
+      if (nextIds.length) {
+        const curIds = new Set(g.nodes.map(n => n.id));
+        const added = nextIds.filter(id => !curIds.has(id));
+        const removed = (g.nodes || []).map(n => n.id).filter(id => !nextIds.includes(id));
+        if (added.length || removed.length) {
+          st.targetIds = nextIds;
+          changed = true;
+          try {
+            if (removed.length) await api.delNodes(gid, removed);
+            if (added.length) await api.addNodes(gid, added);
+            await api.run();
+            toast(`「${g.name}」托管已同步订阅：+${added.length} / -${removed.length}`, 'ok');
+          } catch {}
+        } else if (JSON.stringify(nextIds) !== JSON.stringify(st.targetIds)) {
+          st.targetIds = nextIds;
+          changed = true;
+        }
+      }
+    } else {
+      // 掉员修复（钉选等）：托管目标节点被订阅更新等移除时补回
+      const curIds = new Set(g.nodes.map(n => n.id));
+      const missing = st.targetIds.filter(id => !curIds.has(id));
+      if (missing.length) {
+        try { await api.addNodes(gid, missing); await api.run(); toast(`「${g.name}」托管节点缺失 ${missing.length} 个，已自动补齐`, 'ok'); } catch {}
+      }
     }
   }
   if (changed) await steerPersist(all);
@@ -928,11 +983,26 @@ async function onPolicyChange(e) {
   refreshGroups(false);
 }
 // 运行时节点池 = 显式节点 + 订阅匹配节点（去重；fixed 索引仍以显式 nodes 为准）
+function noteSubTags(list) {
+  for (const s of list || []) {
+    if (!s) continue;
+    const id = s.id || (s.subscription && s.subscription.id);
+    const tag = s.tag || (s.subscription && s.subscription.tag);
+    if (id && tag) S.subTagMap.set(id, tag);
+  }
+}
+function subTagOf(n) {
+  return n.subTag || (n.subscriptionID && S.subTagMap.get(n.subscriptionID)) || '';
+}
 function buildPool(g) {
+  noteSubTags((g.subscriptions || []).map(s => s.subscription));
   const seen = new Set(g.nodes.map(n => n.id));
-  g.pool = [...g.nodes];
-  for (const s of g.subscriptions || []) for (const n of s.matchedNodes || []) {
-    if (!seen.has(n.id)) { seen.add(n.id); g.pool.push(n); }
+  g.pool = g.nodes.map(n => ({ ...n, subTag: subTagOf(n) }));
+  for (const s of g.subscriptions || []) {
+    const tag = (s.subscription && s.subscription.tag) || S.subTagMap.get(s.subscription && s.subscription.id) || '';
+    for (const n of s.matchedNodes || []) {
+      if (!seen.has(n.id)) { seen.add(n.id); g.pool.push({ ...n, subTag: tag || subTagOf(n) }); }
+    }
   }
   return g.pool;
 }
@@ -973,16 +1043,18 @@ function nodeVisible(n) {
   if (!S.cfg.showJunk && isJunk(n)) return false;
   if (S.cfg.hideUnavail) { const l = S.lat.get(n.id); if (!l || !l.alive) return false; }
   if (!S.filter) return true;
-  return (n.name + ' ' + (n.protocol || '') + ' ' + (n.tag || '')).toLowerCase().includes(S.filter);
+  return (n.name + ' ' + (n.protocol || '') + ' ' + (n.tag || '') + ' ' + (n.subTag || '')).toLowerCase().includes(S.filter);
 }
 function nodeCardHtml(g, n, rec, pred, st) {
   const l = S.lat.get(n.id);
   const isNow = rec && rec.nodeId === n.id;
   const isPinned = st && st.mode === 'node' && (st.targetIds || []).includes(n.id);
   const latTxt = l && l.latencyMs != null ? l.latencyMs + 'ms' : (l && !l.alive ? '超时' : '—');
-  return `<div class="node-card${isNow ? ' now' : ''}${isPinned ? ' pinned' : ''}${l && !l.alive && l.testedAt ? ' dead' : ''}" data-node="${n.id}" title="点击测速｜📌 钉选为组内唯一节点（fixed）｜🗑 删除节点">
+  const src = n.subTag || '';
+  return `<div class="node-card${isNow ? ' now' : ''}${isPinned ? ' pinned' : ''}${l && !l.alive && l.testedAt ? ' dead' : ''}" data-node="${n.id}" title="点击测速｜📌 钉选为组内唯一节点（fixed）｜🗑 删除节点${src ? '｜订阅：' + esc(src) : ''}">
     <div class="r1"><span class="nn" title="${esc(n.name)}">${esc(n.name)}</span><span class="proto">${esc(n.protocol || '')}</span>
       <span class="nbtns"><button class="nbtn pin${isPinned ? ' on' : ''}" data-pin="${g.id}|${n.id}" title="${isPinned ? '当前钉选节点' : '钉选：组内仅保留此节点（fixed）'}" aria-label="钉选节点"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 3h6l1 7 2 3H6l2-3 1-7Z"/></svg></button><button class="nbtn" data-del="${n.id}" title="从 daed 删除此节点（组内成员自动同步移除）" aria-label="删除节点"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button></span></div>
+    ${src ? `<div class="n-sub" title="来源订阅">${esc(src)}</div>` : ''}
     <span class="lat ${latClass(l && l.latencyMs)}" data-lat="${n.id}" title="${isNow ? '当前实际出口 · ' : ''}点击重测${l && l.message ? '｜' + esc(l.message) : ''}">${latTxt}</span>
     ${l && !l.alive && l.message ? `<div class="n-msg" title="${esc(l.message)}">${esc(l.message)}</div>` : ''}
     ${isNow ? '<div class="hint" style="font-size:10.5px">● 当前实际出口</div>' : ''}
