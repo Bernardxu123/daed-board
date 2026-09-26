@@ -96,6 +96,10 @@ const S = {
   filter: '', logFilter: '', logOb: '', nodeFilter: '', nodeSub: '', memAvailKB: null,
   lastTs: {}, inflight: new Set(),
   logCur: { inode: null, off: 0 },   // 3.2 出口记录增量游标：只放内存（多标签页天然隔离，重开页面走一次回填）
+  _groupsKey: '',                    // 代理页组卡片结构 key：不变则只走值层更新，不整页重建
+  _nodesKey: '',                     // 节点表 render key（同理）
+  _navKey: '',                       // 侧栏/顶栏结构 key：不变则不重建导航
+  lastErrAt: 0,                      // gql 最后一次出错的时间（轮询退避用）
   authed: false,
 };
 function saveCfg() { localStorage.setItem(CFG_KEY, JSON.stringify(S.cfg)); }
@@ -132,15 +136,18 @@ async function gql(query, variables, timeoutMs = 30000) {
       body: JSON.stringify({ query, variables }),
     }, timeoutMs);
   } catch (e) {
+    S.lastErrAt = Date.now();   // 供轮询调度器退避（daed run 期间/后端不可达时别按原周期重试）
     setBanner('无法连接 daed 后端（' + esc(gqlUrl()) + '）：' + esc(e.name === 'AbortError' ? '超时' : e.message));
     throw e;
   }
   setBanner('');
   let j;
-  try { j = await r.json(); } catch { throw new Error('后端响应不是 JSON（HTTP ' + r.status + '）'); }
+  try { j = await r.json(); } catch { S.lastErrAt = Date.now(); throw new Error('后端响应不是 JSON（HTTP ' + r.status + '）'); }
   if (j.errors) {
     const msg = j.errors.map(e => e.message).join('; ');
-    if (/permission denied|unauthorized|token/i.test(msg)) throw new AuthError(msg);
+    // 只认真正的认证失败：原来的 /token/i 会把任何回显了订阅链接
+    // （链接里常带 ?token=…）的错误误判成登录过期，把用户踢出去重新登录
+    if (r.status === 401 || /permission denied|unauthorized|invalid.*(token|credential)|token.*(expired|invalid)/i.test(msg)) throw new AuthError(msg);
     throw new Error(msg);
   }
   return j.data;
@@ -169,16 +176,24 @@ const LATS_Q = `nodeLatencies { id latencyMs alive testedAt message }`;
 const api = {
   groups: async () => (await gql(`query { ${GROUPS_Q} }`)).groups,
   latencies: async ids => (await gql(`query($ids:[ID!]) { nodeLatencies(ids:$ids) { id latencyMs alive testedAt message } }`, { ids })).nodeLatencies,
+  // 代理页一次往返拿 groups + 全量延迟（原来两个串行 POST + 两次 CORS 预检）
+  groupsWithLatencies: async () => {
+    const d = await gql(`query { ${GROUPS_Q} ${LATS_Q} }`);
+    return { groups: d.groups, latencies: d.nodeLatencies };
+  },
   test: async ids => (await gql(`mutation($ids:[ID!]) { testNodeLatencies(ids:$ids) { id latencyMs alive testedAt message } }`, { ids }, 300000)).testNodeLatencies,
   /* 1.2 自适应窗口：缓冲不足时回填 10 分钟（240 点 ≈2.75s/点），
    * 稳态只取 2 分钟（60 点 ≈2.25s/点）——比改动前的固定 600/120（5.25s/点、10.4KB）更密且更省。
    * 1.10 withLatency=true 时把 groups + 全量 nodeLatencies 并进同一条查询（概览页每 30s 触发一次），
    * 于是"速率 / 分组 / 延迟"在同一个往返里原子返回，省一次 POST 与一次 CORS 预检。 */
-  overview: async ({ backfill = false, withLatency = false } = {}) => {
+  overview: async ({ backfill = false, withLatency = false, light = false } = {}) => {
     const win = backfill ? 600 : 120, mp = backfill ? 240 : 60;
+    // light=true 只取 general（导航/顶栏要用），不拉 runtimeOverview 采样——
+    // 启动时若首屏不是概览页，拉 240 个速率点纯属浪费
     return gql(`query { general { dae { running modified version }
       interfaces { name flag { up } ip }
-      runtimeOverview(windowSec: ${win}, maxPoints: ${mp}) { updatedAt uploadRate downloadRate uploadTotal downloadTotal activeConnections udpSessions samples { timestamp uploadRate downloadRate } } } ${withLatency ? GROUPS_Q + ' ' + LATS_Q : ''} }`);
+      ${light ? '' : `runtimeOverview(windowSec: ${win}, maxPoints: ${mp}) { updatedAt uploadRate downloadRate uploadTotal downloadTotal activeConnections udpSessions samples { timestamp uploadRate downloadRate } }`}
+    } ${withLatency ? GROUPS_Q + ' ' + LATS_Q : ''} }`);
   },
   general: async () => (await api.overview({ backfill: true })).general,
   nodesPage: () => gql(`query { nodes(first: 999) { totalCount edges { id name address protocol tag subscriptionID } }
@@ -225,8 +240,15 @@ const api = {
 };
 
 /* ================= 日志解析 =================
- * 示例行（已脱敏）：
+ * 两种行格式，按 daed 版本与日志级别出现：
+ * ① 逐连接日志（含 `<->`，带 outbound=/sniffed=）——仅 log_level=debug 时产生。
+ *    2026.09.20 起 dae 把逐连接路由追踪从 Info 降到了 Debug（源码注释：高连接速率下
+ *    吃 CPU/allocs），info 级不再输出。
  * [2026-09-06 12:00:00]  INFO 192.168.1.23:39978 <-> www.example.com:443 dialer=3.🇯🇵 节点A dscp=0 ip=74.125.137.188:443 mac=72:6c:60:1f:ee:60 network=tcp4 outbound=proxy pname= policy=min_avg10 sniffed=www.example.com
+ * ② 组选点记录（info 级的主力行）：
+ * [2026-09-21 20:17:34]  INFO Group selects dialer dialer=8.🇭🇰+香港01 group=proxy network=tcp4
+ * [2026-09-21 20:18:40]  INFO Group re-selects dialer _new_dialer=8.X _old_dialer=8.Y alive_dialers=43 group=proxy latency_delta_ms=0 min_moving_avg=0s network=tcp4 reason=best latency
+ * ② 没有 src/dst/嗅探域名，用 group= 映射到 outbound 列，src/dst 留空。
  * 已知怪癖：IPv6 源端口写作 "…:c562: :37918"；UDP 行含 pid=0；dialer 名含空格与 emoji。
  */
 function parseKV(s) {
@@ -245,18 +267,41 @@ function parseLogLine(line) {
   const h = /^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+(\w+)\s+([\s\S]*)$/.exec(line);
   if (!h) return null;
   const [, ts, level, rest] = h;
-  if (level !== 'INFO' || !rest.includes('<->')) return null;
-  const sep = rest.search(/\s[a-z]+=/);
-  if (sep === -1) return null;
-  const addrPart = rest.slice(0, sep);
-  const kv = parseKV(rest.slice(sep + 1));
-  if (!kv.outbound) return null;
-  const ai = addrPart.indexOf('<->');
+  if (level !== 'INFO') return null;
+  if (rest.includes('<->')) {
+    const sep = rest.search(/\s[a-z]+=/);
+    if (sep === -1) return null;
+    const addrPart = rest.slice(0, sep);
+    const kv = parseKV(rest.slice(sep + 1));
+    if (!kv.outbound) return null;
+    const ai = addrPart.indexOf('<->');
+    return {
+      ts: parseTime(ts), level, raw: line,
+      src: addrPart.slice(0, ai).trim(),
+      dst: addrPart.slice(ai + 3).trim(),
+      ...kv,
+    };
+  }
+  // 组选点记录：selects（每次选点）与 re-selects（策略换点，dialer 在 _new_dialer=）。
+  // 节点名可能含空格（"HK 411ms"、"🇭🇰 香港 - Hy2"），所以取值必须取到下一个
+  // " key=" 边界为止，不能用 \S+（会把名字截断）。
+  const m = /^Group (?:re-)?selects dialer\s+([\s\S]*)$/.exec(rest);
+  if (!m) return null;
+  const body = m[1];
+  const pick = k => {
+    const r = new RegExp('(?:^|\\s)' + k + '=([\\s\\S]*?)(?=\\s[a-z_]+=|$)').exec(body);
+    return r ? r[1].trim() : '';
+  };
+  const dialer = pick('_new_dialer') || pick('dialer');
+  const group = pick('group');
+  if (!dialer || !group) return null;
   return {
-    ts: parseTime(ts), level,
-    src: addrPart.slice(0, ai).trim(),
-    dst: addrPart.slice(ai + 3).trim(),
-    ...kv,
+    ts: parseTime(ts), level, raw: line,
+    src: '', dst: '',
+    outbound: group,
+    dialer,
+    network: pick('network'),
+    policy: pick('policy'),
   };
 }
 const logSeen = new Set(); // 常驻去重集合：避免每次 5s 轮询全量重建 1200 条的 Set
@@ -270,8 +315,13 @@ function ingestLog(text) {
   for (const e of entries) { const k = key(e); if (!logSeen.has(k)) { logSeen.add(k); merged.push(e); } }
   merged.sort((a, b) => b.ts - a.ts);
   S.logEntries = merged.slice(0, 1200);
+  // logSeen 只增不减会随标签页常驻无限增长（一天几万条 key）：随 slice 一起重建
+  logSeen.clear();
   const rec = new Map();
-  for (const e of S.logEntries) if (!rec.has(e.outbound)) rec.set(e.outbound, { raw: e.dialer || '', ts: e.ts, entry: e });
+  for (const e of S.logEntries) {
+    logSeen.add(key(e));
+    if (!rec.has(e.outbound)) rec.set(e.outbound, { raw: e.dialer || '', ts: e.ts, entry: e });
+  }
   S.recent = rec;
 }
 /* 1.7 DNS 上游失败 → 通知中心。
@@ -329,7 +379,11 @@ function recentFor(group) {
 /* ================= 延迟 ================= */
 let histDirty = false;
 function applyLatencies(list) {
+  let changed = false;
   for (const it of list || []) {
+    const prev = S.lat.get(it.id);
+    // 值真变了才算变：同样的数据不该触发整表重建
+    if (!prev || prev.latencyMs !== it.latencyMs || prev.alive !== it.alive || prev.testedAt !== it.testedAt) changed = true;
     S.lat.set(it.id, it);
     const lastTs = S.histTs.get(it.id);
     if (it.latencyMs != null && it.testedAt && it.testedAt !== lastTs) {
@@ -340,6 +394,7 @@ function applyLatencies(list) {
       histDirty = true;
     }
   }
+  if (changed) S._latRev = (S._latRev || 0) + 1;
   if (histDirty) { saveHist(); histDirty = false; }
 }
 function latClass(ms) {
@@ -464,10 +519,17 @@ $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeM
  */
 const STEER_KEY = 'daed-board/steer';
 let steerBusy = false;
+// steer 快照约 47KB：原来每次 steerGet 都整份 JSON.parse（概览页每 tick 6 次、
+// 代理页每次重建 6 次，≈79ms/次）。这里做记忆化，只在写入时失效。
+let _steerCache = null;
 function steerLoadAll() {
-  try { return JSON.parse(localStorage.getItem('db.steer') || '{}'); } catch { return {}; }
+  if (_steerCache) return _steerCache;
+  try { _steerCache = JSON.parse(localStorage.getItem('db.steer') || '{}'); } catch { _steerCache = {}; }
+  return _steerCache;
 }
-function steerSaveAll(all) { localStorage.setItem('db.steer', JSON.stringify(all)); }
+function steerSaveAll(all) { _steerCache = all; localStorage.setItem('db.steer', JSON.stringify(all)); }
+// 另一个标签页写了快照：丢掉本地缓存，下次读重新 parse（保持多标签页一致性）
+window.addEventListener('storage', e => { if (e.key === 'db.steer') _steerCache = null; });
 async function steerPersist(all) {
   steerSaveAll(all);
   try { await api.setStorage([STEER_KEY], [JSON.stringify(all)]); } catch {}
@@ -485,9 +547,9 @@ function steerGet(gid) { return steerLoadAll()[gid] || null; }
 function snapshotGroup(g) {
   return {
     explicitIds: g.nodes.map(n => n.id),
-    explicitNodes: g.nodes.map(n => ({ id: n.id, name: n.name, protocol: n.protocol || '', tag: n.tag || '', address: n.address || '' })),
+    explicitNodes: g.nodes.map(n => ({ id: n.id, name: n.name, protocol: n.protocol || '', tag: n.tag || '', address: n.address || '', subscriptionID: n.subscriptionID })),
     subs: (g.subscriptions || []).map(s => ({ id: s.subscription.id, nameFilterRegex: s.nameFilterRegex || null })),
-    pool: (g.pool || g.nodes).map(n => ({ id: n.id, name: n.name, protocol: n.protocol || '', tag: n.tag || '' })),
+    pool: (g.pool || g.nodes).map(n => ({ id: n.id, name: n.name, protocol: n.protocol || '', tag: n.tag || '', subscriptionID: n.subscriptionID })),
     at: Date.now(),
   };
 }
@@ -560,8 +622,10 @@ async function pinToNode(g, node, opts) {
     const targetId = idx.alive.has(node.id) ? node.id : idx.byName.get(node.name);
     if (!targetId) { if (!silent) toast('该节点已不存在于 daed', 'err'); return false; }
     if (!silent) {
+      const hasSubs = (g.subscriptions || []).length > 0;
       const ok = await showConfirm(
         `将把「<b>${esc(g.name)}</b>」组收缩为仅含「<b>${esc(node.name)}</b>」一个节点，策略切换为 <b>fixed</b>，并重载 daed —— <b>代理连接会瞬断 1-2 秒</b>。<br>` +
+        (hasSubs ? `<span style="color:var(--yellow)">注意：该组当前挂着的 ${(g.subscriptions || []).length} 个订阅匹配会暂时解除（订阅和节点都保留）。</span><br>` : '') +
         `恢复点已保存：点「全局」恢复原成员与原策略（${esc(st.savedPolicy)}）。确定继续？`);
       if (!ok) return false;
     }
@@ -673,17 +737,28 @@ async function swapNode(g) {
 // 订阅更新会"删旧建新"重建节点 id（名称不变）。这里建立 节点名称→当前id 索引，
 // 用于把托管快照里的旧 id 映射回当前 id；旧 id 仍存活则优先保留。
 async function nodeIndex() {
-  const alive = new Set(), byName = new Map();
+  const alive = new Set(), byName = new Map(), bySubName = new Map();
   // 顶层 nodes 只含独立节点，订阅节点必须逐订阅取。
   // 此索引用于托管恢复时的成员映射——失败必须抛错（静默降级会静默丢弃组员）。
-  const d = await gql(`query { nodes(first: 999) { edges { id name } } subscriptions { nodes(first: 999) { edges { id name } } } }`);
-  for (const e of (d.nodes.edges || [])) { alive.add(e.id); if (!byName.has(e.name)) byName.set(e.name, e.id); }
-  for (const s of (d.subscriptions || [])) for (const e of (s.nodes.edges || [])) { alive.add(e.id); if (!byName.has(e.name)) byName.set(e.name, e.id); }
-  for (const g of S.groups) for (const n of (g.pool || g.nodes || [])) { alive.add(n.id); if (!byName.has(n.name)) byName.set(n.name, n.id); }
+  // bySubName：按订阅分组的名字→id。订阅"删旧建新"后全局 byName 取的是第一个
+  // 撞名条目，可能把别家订阅的同名节点塞进托管组；同订阅内映射优先。
+  const d = await gql(`query { nodes(first: 999) { edges { id name subscriptionID } } subscriptions { nodes(first: 999) { edges { id name subscriptionID } } } }`);
+  const put = (m, k, v) => { if (k && !m.has(k)) m.set(k, v); };
+  for (const e of (d.nodes.edges || [])) {
+    alive.add(e.id); put(byName, e.name, e.id);
+    if (e.subscriptionID) { if (!bySubName.has(e.subscriptionID)) bySubName.set(e.subscriptionID, new Map()); put(bySubName.get(e.subscriptionID), e.name, e.id); }
+  }
+  for (const s of (d.subscriptions || [])) for (const e of (s.nodes.edges || [])) {
+    alive.add(e.id); put(byName, e.name, e.id);
+    if (s.id) { if (!bySubName.has(s.id)) bySubName.set(s.id, new Map()); put(bySubName.get(s.id), e.name, e.id); }
+  }
+  for (const g of S.groups) for (const n of (g.pool || g.nodes || [])) { alive.add(n.id); put(byName, n.name, n.id); }
   const mk = backup => id => {
     if (alive.has(id)) return id;
     const b = (backup.pool || []).find(p => p.id === id) || (backup.explicitNodes || []).find(x => x.id === id);
-    return (b && byName.get(b.name)) || null;
+    if (!b) return null;
+    const sub = bySubName.get(b.subscriptionID);
+    return (sub && sub.get(b.name)) || byName.get(b.name) || null;
   };
   return { alive, byName, mk };
 }
@@ -974,7 +1049,12 @@ async function onPolicyChange(e) {
     (policy === 'fixed' ? '<span style="color:var(--yellow)">fixed 策略要求组内只有一个节点，多节点组会被 daed 拒绝并自动回退。</span><br>' : '') +
     '确定继续？');
   if (!ok) { renderGroups(); return; }
-  const apply = (p) => api.setPolicy(g.id, p, p === 'fixed' ? [{ key: '', val: '0' }] : []).then(() => api.run());
+  // 只有 fixed 需要显式给 index 参数；其他策略原样回传该组当前的 policyParams，
+  // 否则一切换就把组上已有的参数抹成空（min_avg10 的 N、min_moving_avg 的窗口等）
+  const curParams = (g.policyParams && g.policyParams.length)
+    ? g.policyParams.map(p => ({ key: p.key || '', val: p.val || '' }))
+    : [];
+  const apply = (p) => api.setPolicy(g.id, p, p === 'fixed' ? [{ key: '', val: '0' }] : curParams).then(() => api.run());
   try {
     await apply(policy);
     toast(`「${g.name}」策略已切换为 ${policy}`, 'ok');
@@ -1001,7 +1081,14 @@ function subTagOf(n) {
     || '';
 }
 /** 全局 nodeId→订阅tag 索引：托管时组内订阅被拆掉，卡片来源不能只靠 g.subscriptions */
+// 订阅 → 节点 tag 反查：原来每次 groups 刷新都无条件拉一次
+// subscriptions{first:999}（最大查询之一），纯粹为了填节点卡上的"来源订阅"。
+// 这里按 120s 节流，且不与在途的订阅查询并发。
+let _subTagLast = 0, _subTagBusy = false;
 async function syncSubTagIndex() {
+  if (_subTagBusy) return false;
+  if (Date.now() - _subTagLast < 120000) return false;
+  _subTagBusy = true;
   try {
     const d = await gql(`query { subscriptions { id tag nodes(first: 999) { edges { id subscriptionID } } } }`);
     for (const s of d.subscriptions || []) {
@@ -1010,8 +1097,10 @@ async function syncSubTagIndex() {
         if (e && e.id) S.nodeSubTag.set(e.id, s.tag || '');
       }
     }
+    _subTagLast = Date.now();
     return true;
   } catch { return false; }
+  finally { _subTagBusy = false; }
 }
 function buildPool(g) {
   noteSubTags((g.subscriptions || []).map(s => s.subscription));
@@ -1045,13 +1134,15 @@ async function refreshGroups(manual, opts) {
   S.inflight.add('groups');
   const skipLat = !!(opts && opts.skipLat);
   try {
-    const gs = (await api.groups()) || [];
-    const ids = [...new Set(gs.flatMap(g => buildPool(g).map(n => n.id)))];
     if (skipLat) {
+      const gs = (await api.groups()) || [];
+      const ids = [...new Set(gs.flatMap(g => buildPool(g).map(n => n.id)))];
       applyGroupsPayload(gs, []);
       if (ids.length) api.latencies(ids).then(lats => { applyLatencies(lats || []); if (S.page === 'proxies') renderGroups(); }).catch(() => {});
     } else {
-      applyGroupsPayload(gs, ids.length ? await api.latencies(ids) : []);
+      // 一次往返拿 groups + 延迟（skipLat 的路径给"先出结构再补延迟"的首屏用）
+      const { groups: gs, latencies: lats } = await api.groupsWithLatencies();
+      applyGroupsPayload(gs || [], lats || []);
     }
     if (manual) toast('已刷新', 'ok');
   } catch (e) {
@@ -1066,20 +1157,96 @@ function nodeVisible(n) {
   if (!S.filter) return true;
   return (n.name + ' ' + (n.protocol || '') + ' ' + (n.tag || '') + ' ' + (n.subTag || '')).toLowerCase().includes(S.filter);
 }
-function nodeCardHtml(g, n, rec, pred, st) {
+// explicitSet：该组的显式成员 id 集合。订阅匹配进来（不在集合里）的节点标注
+// 「订阅匹配」且不给 🗑——对它们点删除是**从 daed 全库删除**，且订阅更新后会复活，
+// 正确做法是改订阅的 nameFilterRegex 或取消匹配。
+function nodeCardHtml(g, n, rec, pred, st, explicitSet) {
   const l = S.lat.get(n.id);
   const isNow = rec && rec.nodeId === n.id;
   const isPinned = st && st.mode === 'node' && (st.targetIds || []).includes(n.id);
+  const isMatched = !!(explicitSet && !explicitSet.has(n.id));
   const latTxt = l && l.latencyMs != null ? l.latencyMs + 'ms' : (l && !l.alive ? '超时' : '—');
   const src = n.subTag || '';
-  return `<div class="node-card${isNow ? ' now' : ''}${isPinned ? ' pinned' : ''}${l && !l.alive && l.testedAt ? ' dead' : ''}" data-node="${n.id}" title="点击测速｜📌 钉选为组内唯一节点（fixed）｜🗑 删除节点${src ? '｜订阅：' + esc(src) : ''}">
+  return `<div class="node-card${isNow ? ' now' : ''}${isPinned ? ' pinned' : ''}${isMatched ? ' matched' : ''}${l && !l.alive && l.testedAt ? ' dead' : ''}" data-node="${n.id}" title="点击测速｜📌 钉选为组内唯一节点（fixed）${isMatched ? '｜订阅匹配节点（删除请改订阅正则）' : '｜🗑 删除节点'}${src ? '｜订阅：' + esc(src) : ''}">
     <div class="r1"><span class="nn" title="${esc(n.name)}">${esc(n.name)}</span><span class="proto">${esc(n.protocol || '')}</span>
-      <span class="nbtns"><button class="nbtn pin${isPinned ? ' on' : ''}" data-pin="${g.id}|${n.id}" title="${isPinned ? '当前钉选节点' : '钉选：组内仅保留此节点（fixed）'}" aria-label="钉选节点"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 3h6l1 7 2 3H6l2-3 1-7Z"/></svg></button><button class="nbtn" data-del="${n.id}" title="从 daed 删除此节点（组内成员自动同步移除）" aria-label="删除节点"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button></span></div>
-    ${src ? `<div class="n-sub" title="来源订阅">${esc(src)}</div>` : ''}
+      <span class="nbtns"><button class="nbtn pin${isPinned ? ' on' : ''}" data-pin="${g.id}|${n.id}" title="${isPinned ? '当前钉选节点' : '钉选：组内仅保留此节点（fixed）'}" aria-label="钉选节点"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 3h6l1 7 2 3H6l2-3 1-7Z"/></svg></button>${isMatched ? '' : `<button class="nbtn" data-del="${n.id}" title="从 daed 删除此节点（组内成员自动同步移除）" aria-label="删除节点"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button>`}</span></div>
+    ${src ? `<div class="n-sub" title="来源订阅${isMatched ? ' · 订阅匹配进组' : ''}">${esc(src)}${isMatched ? ' · 匹配' : ''}</div>` : ''}
     <span class="lat ${latClass(l && l.latencyMs)}" data-lat="${n.id}" title="${isNow ? '当前实际出口 · ' : ''}点击重测${l && l.message ? '｜' + esc(l.message) : ''}">${latTxt}</span>
     ${l && !l.alive && l.message ? `<div class="n-msg" title="${esc(l.message)}">${esc(l.message)}</div>` : ''}
     ${isNow ? '<div class="hint" style="font-size:10.5px">● 当前实际出口</div>' : ''}
   </div>`;
+}
+// 组卡片出口行的内容（结构与值分离后，值层更新也复用它）
+function exitLineInner(g, fixed, rec, pred, st) {
+  if (fixed) {
+    return `<span class="item"><span class="dot on"></span>固定出口 <span class="val" title="${esc(fixed.name)}">${esc(fixed.name)}</span></span>
+        ${rec ? `<span class="item">日志核实 <span class="val">${esc(rec.name)}</span><span class="hint">${ago(rec.ts)}</span></span>` : ''}`;
+  }
+  const managedLabel = st && st.mode === 'node' ? `钉选 · ${esc(st.pinnedName || '')}` : (st ? `托管 · ${esc(regionName(st.region))}` : '');
+  return `${st ? `<span class="tag ok">${managedLabel}</span>` : ''}
+        <span class="item">实际出口 <span class="val" title="来自 daed 连接日志（真值）">${rec ? esc(rec.name) : '—'}</span>${rec ? `<span class="hint">${ago(rec.ts)}</span>` : ''}</span>
+        ${g.policy === 'random' ? '' : `<span class="pred">预计 ${pred ? esc(pred.node.name) : '—'}${pred && pred.samples < 3 ? ' ≈' : ''}</span>`}`;
+}
+// 组卡片结构 key：只有这些变化才需要整页重建（照概览页 ovStructKey 的思路）。
+// 延迟/实际出口/存活标记全是值层，走 updateGroupValues()，不再整页 innerHTML。
+function groupsStructKey() {
+  return S.groups.map(g => {
+    const st = steerGet(g.id);
+    const eff = poolEff(g);
+    return [g.id, g.policy, (g.nodes || []).length, eff.length,
+      st ? st.mode + ':' + (st.region || '') + ':' + (st.targetIds || []).join('+') : '-',
+      S.closedGroups.has(g.id) ? 'c' : 'o',
+      S.filter || '-', S.cfg.hideUnavail ? 1 : 0, S.cfg.sort || '-',
+      S.testingGroups.has(g.id) ? 't' : '-',
+      eff.filter(n => n.subTag).length,
+      (g.subscriptions || []).map(s => (s.subscription && s.subscription.id) + ':' + (s.matchedNodes || []).length + ':' + (s.nameFilterRegex || '')).join('~')
+      ].join('~');
+  }).join('|');
+}
+// 值层更新：只改出口行文本、头部计数、延迟药丸、分布点与 now/dead 类，不重建 DOM 树
+function updateGroupValues() {
+  for (const g of S.groups) {
+    const card = document.querySelector('.gcard[data-g="' + g.id + '"]');
+    if (!card) continue;
+    const rec = recentFor(g);
+    const pred = g.policy === 'random' ? null : predictFor(g);
+    const fixed = g.policy === 'fixed' ? fixedNodeFor(g) : null;
+    const st = steerGet(g.id);
+    const eff = poolEff(g);
+    const line = card.querySelector('.exit-line');
+    if (line) line.innerHTML = exitLineInner(g, fixed, rec, pred, st);
+    const cnt = card.querySelector('.g-head .cnt');
+    if (cnt) cnt.textContent = eff.filter(nodeVisible).length + '/' + eff.length;
+    card.querySelectorAll('.node-card[data-node]').forEach(el => {
+      const id = el.getAttribute('data-node');
+      const l = S.lat.get(id);
+      const pill = el.querySelector('.lat');
+      if (pill) {
+        pill.textContent = l && l.latencyMs != null ? l.latencyMs + 'ms' : (l && !l.alive ? '超时' : '—');
+        pill.className = 'lat ' + latClass(l && l.latencyMs);
+      }
+      el.classList.toggle('now', !!(rec && rec.nodeId === id));
+      el.classList.toggle('dead', !!(l && !l.alive && l.testedAt));
+    });
+    const dots = card.querySelectorAll('.dots i');
+    for (let i = 0; i < dots.length; i++) {
+      const n = eff[i];
+      if (!n) continue;
+      const l = S.lat.get(n.id);
+      dots[i].className = (l && l.latencyMs != null ? ' ' + latClass(l.latencyMs) : '') + ((rec && rec.nodeId === n.id) ? ' now' : '');
+    }
+  }
+}
+// 日志轮询专用：只刷出口行（延迟没变，动整页纯属浪费）
+function updateGroupExits() {
+  for (const g of S.groups) {
+    const line = document.querySelector('.gcard[data-g="' + g.id + '"] .exit-line');
+    if (!line) continue;
+    const rec = recentFor(g);
+    const pred = g.policy === 'random' ? null : predictFor(g);
+    const fixed = g.policy === 'fixed' ? fixedNodeFor(g) : null;
+    line.innerHTML = exitLineInner(g, fixed, rec, pred, steerGet(g.id));
+  }
 }
 function renderGroups() {
   const box = $('#px-groups');
@@ -1087,6 +1254,9 @@ function renderGroups() {
   // 用户正在组卡片内交互（如展开策略下拉）时跳过重渲染，避免下拉被轮询重建打断
   if (document.activeElement && box.contains(document.activeElement) && document.activeElement.classList.contains('policy-select')) return;
   if (!S.groups.length) { box.innerHTML = '<div class="empty">没有分组数据</div>'; return; }
+  const key = groupsStructKey();
+  if (key === S._groupsKey) { updateGroupValues(); return; }
+  S._groupsKey = key;
   box.innerHTML = S.groups.map(g => {
     const eff = poolEff(g);
     const pred = g.policy === 'random' ? null : predictFor(g);
@@ -1095,7 +1265,7 @@ function renderGroups() {
     const fixed = g.policy === 'fixed' ? fixedNodeFor(g) : null;
     const st = steerGet(g.id);
     const policyOpts = ['random', 'fixed', 'min', 'min_avg10', 'min_moving_avg']
-      .map(p => `<option value="${p}" ${g.policy === p ? 'selected' : ''} ${p === 'fixed' && g.nodes.length > 1 ? 'disabled' : ''}>${p}${p === 'fixed' && g.nodes.length > 1 ? '（需单节点组）' : ''}</option>`).join('');
+      .map(p => `<option value="${p}" ${g.policy === p ? 'selected' : ''} ${p === 'fixed' && (g.nodes.length > 1 || !g.nodes.length) ? 'disabled' : ''}>${p}${p === 'fixed' && (g.nodes.length > 1 || !g.nodes.length) ? '（需单节点组）' : ''}</option>`).join('');
     const head = `
       <div class="g-head" data-head="${g.id}">
         <div class="gn"><span>${esc(g.name)}</span><span class="cnt">${visible.length}/${eff.length}</span></div>
@@ -1104,24 +1274,24 @@ function renderGroups() {
         <span class="spacer"></span>
         ${g.policy === 'fixed' ? `<button class="btn btn-sm" data-swap="${g.id}" title="更换 fixed 组的节点">✎ 换节点</button>` : ''}
         <select class="policy-select" data-g="${g.id}" title="切换选点策略（重载后生效，代理连接瞬断 1-2 秒）">${policyOpts}</select>
+        <button class="btn btn-sm" data-gaddsub="${g.id}" title="把订阅按名称正则匹配进该组（订阅更新时自动对账）">＋ 订阅</button>
         <button class="btn btn-sm" data-gadd="${g.id}" title="添加节点到此分组">＋ 节点</button>
         <button class="btn btn-sm ${S.testingGroups.has(g.id) ? 'btn-primary' : ''}" data-gtest="${g.id}" title="测试本组全部节点">⚡ 测速</button>
       </div>`;
-    let exitLine;
-    if (fixed) {
-      exitLine = `<div class="exit-line">
-        <span class="item"><span class="dot on"></span>固定出口 <span class="val" title="${esc(fixed.name)}">${esc(fixed.name)}</span></span>
-        ${rec ? `<span class="item">日志核实 <span class="val">${esc(rec.name)}</span><span class="hint">${ago(rec.ts)}</span></span>` : ''}
-      </div>`;
-    } else {
-      const managedLabel = st && st.mode === 'node' ? `钉选 · ${esc(st.pinnedName || '')}` : (st ? `托管 · ${esc(regionName(st.region))}` : '');
-      exitLine = `<div class="exit-line">
-        ${st ? `<span class="tag ok">${managedLabel}</span>` : ''}
-        <span class="item">实际出口 <span class="val" title="来自 daed 连接日志（真值）">${rec ? esc(rec.name) : '—'}</span>${rec ? `<span class="hint">${ago(rec.ts)}</span>` : ''}</span>
-        ${g.policy === 'random' ? '' : `<span class="pred">预计 ${pred ? esc(pred.node.name) : '—'}${pred && pred.samples < 3 ? ' ≈' : ''}</span>`}
-      </div>`;
-    }
-    // 区域选择 chips：托管中显示快照全池的区域视图，未托管显示当前池
+    // 订阅匹配行：tag + 匹配数 + 正则（可点改）+ ✕ 取消匹配
+    const subLine = (g.subscriptions || []).length ? `<div class="sub-row"><span class="k">订阅匹配</span>${(g.subscriptions || []).map(s => {
+      const sid = s.subscription && s.subscription.id;
+      // 组载荷里的 subscription.tag 有时是 null，用本地订阅清单兜底
+      const tag = (s.subscription && s.subscription.tag) || S.subTagMap.get(sid) ||
+        ((S.subs || []).find(x => x.id === sid) || {}).tag || '订阅';
+      const n = (s.matchedNodes || []).length;
+      return `<span class="sub-chip" title="该订阅有 ${n} 个节点匹配进本组${s.nameFilterRegex ? '（正则 ' + esc(s.nameFilterRegex) + '）' : '（未设正则＝全部）'}">
+        <b>${esc(tag)}</b>${n} 个
+        ${s.nameFilterRegex ? `<i class="rgx" data-subre="${g.id}|${esc(s.subscription.id)}" title="点击修改名称正则">${esc(s.nameFilterRegex)}</i>` : `<button class="nbtn" data-subre="${g.id}|${esc(s.subscription.id)}" title="设置名称正则" aria-label="设置名称正则"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h10M4 17h7"/></svg></button>`}
+        <button class="nbtn" data-subdel="${g.id}|${esc(s.subscription.id)}" title="从该组取消此订阅匹配（订阅与节点都保留）" aria-label="取消订阅匹配"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button>
+      </span>`;
+    }).join('')}</div>` : '';
+    const exitLine = `<div class="exit-line">${exitLineInner(g, fixed, rec, pred, st)}</div>`;    // 区域选择 chips：托管中显示快照全池的区域视图，未托管显示当前池
     let chips = '';
     if (!fixed) {
       const srcNodes = st
@@ -1148,6 +1318,7 @@ function renderGroups() {
       return `<i class="${cls}${isNow ? ' now' : ''}" title="${esc(n.name)}${l && l.latencyMs != null ? ' · ' + l.latencyMs + 'ms' : ''}"></i>`;
     }).join('');
     const byRegion = regionsOfPool(visible);
+    const explicitSet = new Set((g.nodes || []).map(n => n.id));
     const sections = [...REGIONS.map(r => r.id), 'OT'].filter(rid => (byRegion.get(rid) || []).length).map(rid => {
       const nodes = sortNodes(byRegion.get(rid));
       const best = regionBest(nodes);
@@ -1156,11 +1327,11 @@ function renderGroups() {
           ${best != null ? `<span class="rg-best">最快 ${best}ms</span>` : ''}
           <button class="btn btn-sm btn-ghost" data-rgtest="${g.id}|${rid}" title="测速本区域全部节点">⚡ 测速本区</button>
         </div>
-        <div class="node-grid">${nodes.map(n => nodeCardHtml(g, n, rec, pred, st)).join('')}</div>
+        <div class="node-grid">${nodes.map(n => nodeCardHtml(g, n, rec, pred, st, explicitSet)).join('')}</div>
       </div>`;
     }).join('');
     const open = !S.closedGroups.has(g.id);
-    const body = open ? `${exitLine}${chips}<div class="dots">${dots}</div>${sections}
+    const body = open ? `${exitLine}${subLine}${chips}<div class="dots">${dots}</div>${sections}
       <div style="padding:0 16px 16px"><div class="node-card add-card" data-gadd="${g.id}" title="添加节点到此分组">＋ 添加节点</div></div>` : '';
     return `<section class="card gcard" data-g="${g.id}">${head}${body}</section>`;
   }).join('');
@@ -1219,6 +1390,12 @@ function onGroupsClick(e) {
   if (del) { delNodeAction(del.dataset.del); return; }
   const gadd = t.closest('[data-gadd]');
   if (gadd) { addNodesModal(S.groups.find(x => x.id === gadd.dataset.gadd)); return; }
+  const gaddsub = t.closest('[data-gaddsub]');
+  if (gaddsub) { addSubsModal(S.groups.find(x => x.id === gaddsub.dataset.gaddsub)); return; }
+  const subdel = t.closest('[data-subdel]');
+  if (subdel) { detachSub(subdel.dataset.subdel); return; }
+  const subre = t.closest('[data-subre]');
+  if (subre) { editSubRegex(subre.dataset.subre); return; }
   const pill = t.closest('[data-lat]');
   if (pill) { testNodes([pill.dataset.lat]); return; }
   const card = t.closest('[data-node]');
@@ -1245,7 +1422,9 @@ async function testNodes(ids, group) {
       const res = await api.test(part);
       applyLatencies(res);
       done += part.length;
-      renderGroups(); renderNodesTable();
+      // 每个分片只更值层：整页重建留给 finally 那一次（否则 999 节点 90 秒内重建 85 次）
+      if (S.page === 'proxies') updateGroupValues();
+      if (S.page === 'nodes') renderNodesTable();
     }
     toast(`测速完成（${done} 个节点）`, 'ok');
   } catch (e) {
@@ -1343,6 +1522,85 @@ async function addNodesModal(g) {
   }
   setTimeout(() => refreshGroups(false), 0);
 }
+/* ---------- P3：订阅挂到分组 ---------- */
+// 为什么走订阅匹配而不是手动加节点：订阅更新是"删旧建新"，显式成员会被清掉；
+// 订阅匹配由 daed 自动对账，节点增删都不用管。
+async function addSubsModal(g) {
+  if (!g) return;
+  const st = steerGet(g.id);
+  if (st && st.mode === 'region') return toast('该分组处于区域托管状态，请先切回「全局」再挂订阅', 'err');
+  let subs = S.subs;
+  if (!subs || !subs.length) {
+    try { subs = (await api.nodesPage()).subscriptions || []; S.subs = subs; } catch { return toast('拉取订阅列表失败', 'err'); }
+  }
+  const attached = new Set((g.subscriptions || []).map(s => s.subscription && s.subscription.id));
+  const cands = subs.filter(s => s.id && !attached.has(s.id));
+  if (!cands.length) return toast('没有可挂载的订阅（该组的订阅已全部挂上）', 'err');
+  // 每条订阅一行：勾选 + 自己的名称正则（daed 的 regex 是每次调用一个，故逐个挂）
+  const row = s => `<div class="subpick">
+      <label class="fcheck"><input class="modal-input" type="checkbox" data-key="sub:${esc(s.id)}"> <b>${esc(s.tag || s.id)}</b> <span class="hint">${(s.nodes && s.nodes.totalCount) || 0} 节点</span></label>
+      <input class="modal-input" type="text" data-key="re:${esc(s.id)}" placeholder="名称正则（可选，如 香港|HK；留空＝该订阅全部节点）" spellcheck="false">
+    </div>`;
+  const ok = await showModal({
+    title: `把订阅挂到 <b>${esc(g.name)}</b><br><span class="hint">订阅匹配的节点随订阅更新自动增删，不像显式成员那样需要手动维护。</span>`,
+    fields: [{ type: 'html', html: cands.map(row).join('') }], wide: true,
+  });
+  if (!ok) return;
+  const picked = cands.filter(s => ok['sub:' + s.id]);
+  if (!picked.length) return toast('没有选择任何订阅', 'err');
+  try {
+    for (const s of picked) {
+      await api.addSubs(g.id, [s.id], (ok['re:' + s.id] || '').trim() || null);
+    }
+    await api.run();
+    toast(`已挂载 ${picked.length} 个订阅到「${g.name}」`, 'ok');
+    refreshGroups(true);
+  } catch (e) {
+    if (e instanceof AuthError) return handleAuthError();
+    toast('挂载失败：' + e.message, 'err');
+    refreshGroups(true);
+  }
+}
+async function detachSub(kv) {
+  const [gid, sid] = kv.split('|');
+  const g = S.groups.find(x => x.id === gid);
+  const sub = (g && g.subscriptions || []).find(s => s.subscription && s.subscription.id === sid);
+  if (!(await showConfirm(`把订阅 <b>${esc((sub && sub.subscription.tag) || sid)}</b> 从「${esc((g && g.name) || gid)}」取消匹配？<br><span class="hint">只是不再把该订阅的节点算进这个组；订阅和节点本身都保留。</span>`))) return;
+  try {
+    await api.delSubs(gid, [sid]);
+    await api.run();
+    toast('已取消订阅匹配', 'ok');
+    refreshGroups(true);
+  } catch (e) {
+    if (e instanceof AuthError) return handleAuthError();
+    toast('取消失败：' + e.message, 'err');
+  }
+}
+async function editSubRegex(kv) {
+  const [gid, sid] = kv.split('|');
+  const g = S.groups.find(x => x.id === gid);
+  const sub = (g && g.subscriptions || []).find(s => s.subscription && s.subscription.id === sid);
+  if (!sub) return;
+  const ok = await showModal({
+    title: `「<b>${esc(sub.subscription.tag || '')}</b>」匹配进 <b>${esc((g && g.name) || '')}</b> 的名称正则<br><span class="hint">只把节点名匹配上的算进该组；留空＝该订阅全部节点。改后需要应用改动才生效。</span>`,
+    fields: [{ type: 'text', key: 'regex', label: '名称正则', value: sub.nameFilterRegex || '', placeholder: '如 香港|HK；留空＝全部' }],
+  });
+  if (!ok) return;
+  const re = (ok.regex || '').trim() || null;
+  if (re === (sub.nameFilterRegex || null)) return;
+  try {
+    // daed 没有"改正则" mutation：先摘再挂（同一订阅，节点不用动）
+    await api.delSubs(gid, [sid]);
+    await api.addSubs(gid, [sid], re);
+    await api.run();
+    toast(re ? `已设置正则：${re}` : '已设为匹配全部节点', 'ok');
+    refreshGroups(true);
+  } catch (e) {
+    if (e instanceof AuthError) return handleAuthError();
+    toast('设置失败：' + e.message, 'err');
+    refreshGroups(true);
+  }
+}
 async function delNodeAction(nodeId) {
   const n = S.nodesAll.find(x => x.id === nodeId) ||
     S.groups.flatMap(g => (g.pool || g.nodes)).find(x => x.id === nodeId);
@@ -1379,7 +1637,23 @@ function renderNodesTable() {
   if (!box) return;
   if (!S.nodesAll.length) { box.innerHTML = '<div class="empty">无节点</div>'; return; }
   const list = S.nodesAll.filter(nodeTableVisible);
-  const groupsOf = n => S.groups.filter(g => (g.pool || g.nodes).some(x => x.id === n.id)).map(g => g.name).join(', ');
+  // 预建 nodeId → 分组名（原先在 .map 里逐行 filter，代价 N×G×P；999 节点 ≈36 万次谓词/次）
+  // 订阅匹配进组的标注「（匹配）」：它不是显式成员，删节点/改成员时行为不同
+  const gmap = new Map();
+  for (const g of S.groups) {
+    const ex = new Set((g.nodes || []).map(n => n.id));
+    for (const n of (g.pool || g.nodes)) {
+      const label = g.name + (ex.has(n.id) ? '' : '（匹配）');
+      const cur = gmap.get(n.id);
+      gmap.set(n.id, cur ? (cur.includes(label) ? cur : cur + ', ' + label) : label);
+    }
+  }
+  // render key：筛选/成员/延迟都没变就跳过整表重建（照 renderLogPage 的模式）
+  const key = [list.length, S.nodeFilter, S.nodeSub, S.cfg.hideUnavail ? 1 : 0, S.cfg.showJunk ? 1 : 0,
+    S._latRev || 0,
+    S.groups.map(g => g.id + g.policy + (g.pool || g.nodes).length).join('~')].join('|');
+  if (key === S._nodesKey && box.querySelector('table')) return;
+  S._nodesKey = key;
   // 轮询重渲染前后保持用户勾选（按节点 id 快照回填）
   const keep = new Set($$('#nd-table tbody input[type=checkbox]:checked').map(i => i.value));
   box.innerHTML = `<table class="tbl"><thead><tr>
@@ -1388,12 +1662,12 @@ function renderNodesTable() {
     ${list.map(n => {
       const l = S.lat.get(n.id);
       return `<tr>
-        <td><input type="checkbox" value="${n.id}"></td>
+        <td><input type="checkbox" value="${esc(n.id)}"></td>
         <td>${esc(n.name)}</td>
         <td>${esc((n.protocol || '').toUpperCase())}</td>
         <td class="tag-cell">${esc(n.tag || '')}</td>
         <td class="tag-cell">${esc(n.subTag || '独立节点')}</td>
-        <td class="tag-cell">${esc(groupsOf(n) || '—')}</td>
+        <td class="tag-cell">${esc(gmap.get(n.id) || '—')}</td>
         <td>${latPill(n.id)}</td>
         <td>${l ? (l.alive ? '<span style="color:var(--green)">存活</span>' : `<span style="color:var(--red)" title="${esc(l.message || '')}">不可用</span>`) : '—'}</td>
         <td class="mono tag-cell">${ago(parseTime(l && l.testedAt)) || '—'}</td>
@@ -1418,14 +1692,23 @@ async function refreshGeneral() {
   if (S.inflight.has('general')) return;
   S.inflight.add('general');
   try {
-    const backfill = S.ovBuf.length < 60;                                   // 1.2 缓冲不足 → 回填 10 分钟
+    // 只有概览页需要速率采样；别的页面（含启动首屏）只拿 general 就够了
+    const needRates = S.page === 'overview';
+    const backfill = needRates && S.ovBuf.length < 60;                   // 1.2 缓冲不足 → 回填 10 分钟
     const wantGroups = Date.now() - ovGroupsTs > Math.max(10, S.cfg.groupSec - 5) * 1000;
     if (wantGroups) ovGroupsTs = Date.now();
-    const d = await api.overview({ backfill, withLatency: wantGroups && !!S.groups.length });
+    const d = await api.overview({ backfill, withLatency: wantGroups && !!S.groups.length, light: !needRates });
     S.general = d.general;
     mergeSamples(S.general && S.general.runtimeOverview);
-    if (!S.cfgGlobal) { try { S.cfgGlobal = (await api.configsAll()).find(x => x.selected) || null; } catch {} }
-    if (!S.subs || !S.subs.length) { try { S.subs = (await api.nodesPage()).subscriptions || []; } catch {} }
+    // 配置与订阅清单并行拉：原来是两个串行 RTT，首进概览页要等三轮
+    if (!S.cfgGlobal || !S.subs || !S.subs.length) {
+      const [cfgR, nodesR] = await Promise.all([
+        S.cfgGlobal ? null : api.configsAll().catch(() => null),
+        (S.subs && S.subs.length) ? null : api.nodesPage().catch(() => null),
+      ]);
+      if (cfgR) { try { S.cfgGlobal = cfgR.find(x => x.selected) || null; } catch {} }
+      if (nodesR) { try { S.subs = nodesR.subscriptions || []; } catch {} }
+    }
     if (d.groups) applyGroupsPayload(d.groups, d.nodeLatencies);            // 1.10 与速率同一往返返回
     renderOverview();
     updateNavState();
@@ -1554,31 +1837,6 @@ function ovHtml(m) {
     </section>
 
     <section class="card span8">
-      <div class="card-head"><h2>实时速率</h2><span class="sub">来源 runtimeOverview 采样</span>
-        <span class="spacer"></span>
-        <span class="legend"><span class="lg-dl"><i></i>下载</span><span class="lg-ul"><i></i>上传</span></span></div>
-      <div class="chart-meta"><span class="big pdn" id="ov-big-dl">${fmtRate(downNow)}<i>下载</i></span><span class="big pub" id="ov-big-ul">${fmtRate(upNow)}<i>上传</i></span>
-        <span class="hint" id="ov-updated">更新于 ${hhmm(parseTime(ov.updatedAt)) || '—'}</span></div>
-      <div class="chart-wrap" id="ov-chart"></div>
-      <div class="chart-axis"><span id="ax-start">${ax.start}</span><span id="ax-peak">峰值 ${ax.peak}</span><span id="ax-end">${ax.end}</span></div>
-    </section>
-
-    <section class="card span4">
-      <div class="card-head"><h2>系统状态</h2><span class="spacer"></span><button class="btn btn-sm btn-ghost" data-nav="config">配置 →</button></div>
-      <div class="state-list">
-        ${[
-          { k: '运行状态', v: g.dae.running ? '运行中' : '已停止', tag: g.dae.running ? 'ok' : 'err' },
-          { k: '核心版本', v: g.dae.version || '—' },
-          { k: '配置状态', v: g.dae.modified ? '有改动未应用' : '已生效', tag: g.dae.modified ? 'warn' : 'ok' },
-          { k: '拨号模式', v: cfg.dialMode || '—' },
-          { k: '日志级别', v: cfg.logLevel || '—' },
-          { k: '测速间隔', v: (cfg.checkInterval || '—') + ' / 容差 ' + (cfg.checkTolerance || '—') },
-          { k: '内存可用', v: memMB != null ? memMB + ' MB' : '—', tag: memMB != null && memMB < 180 ? 'warn' : 'ok' },
-        ].map((s, i) => `<div class="state-row"><span class="k">${esc(s.k)}</span><span class="v" id="stv-${i}" title="${esc(s.v)}">${esc(s.v)}</span>${s.tag ? `<span class="tag ${s.tag}" id="stt-${i}">${s.tag === 'ok' ? '正常' : s.tag === 'warn' ? '注意' : '停止'}</span>` : ''}</div>`).join('')}
-      </div>
-    </section>
-
-    <section class="card span8">
       <div class="card-head"><h2>定时任务与后台操作</h2><span class="sub">订阅 cron · 内存守卫 · 场景预设</span></div>
       ${tasks.map((t, i) => `
       <div class="task">
@@ -1620,7 +1878,19 @@ function ovHtml(m) {
 }
 function bindOverviewEvents() {}
 /* 1.9 数值层：只写需要变的节点，不重建 DOM */
+// 3 秒 tick 会连续调它；包一层 rAF 把同一帧内的多次调用合并成一次写 DOM，
+// 避免每次 textContent 都各自触发一次样式重算（观感上的“卡顿”主要来源）。
+let _ovRaf = 0, _ovPending = null;
 function ovUpdate(m) {
+  _ovPending = m;
+  if (_ovRaf) return;
+  _ovRaf = requestAnimationFrame(() => {
+    _ovRaf = 0;
+    const mm = _ovPending; _ovPending = null;
+    if (mm) ovUpdateNow(mm);
+  });
+}
+function ovUpdateNow(m) {
   const { ov, upNow, downNow, upInstant, downInstant, dlSpark, ulSpark, memSpark, memMB,
           aliveN, totalN, ax, cfg, g } = m;
   const el = id => document.getElementById(id);
@@ -1640,9 +1910,9 @@ function ovUpdate(m) {
   }
   html('kpi-alive-val', `${aliveN}<small>/ ${totalN}</small>`);
   txt('kpi-alive-ctx', `${S.groups.length} 个分组 · min 策略自动择优`);
-  html('sp-dl', dlSpark.length >= 2 ? sparkline(dlSpark, 'var(--primary)') : '');
-  html('sp-ul', ulSpark.length >= 2 ? sparkline(ulSpark, 'var(--success)') : '');
-  html('sp-mem', memSpark.length >= 2 ? sparkline(memSpark, 'var(--warning)') : '');
+  sparklineInto(el('sp-dl'), dlSpark, 'var(--primary)');
+  sparklineInto(el('sp-ul'), ulSpark, 'var(--success)');
+  sparklineInto(el('sp-mem'), memSpark, 'var(--warning)');
 
   html('ov-big-dl', `${fmtRate(downNow)}<i>下载</i>`);
   html('ov-big-ul', `${fmtRate(upNow)}<i>上传</i>`);
@@ -1697,6 +1967,26 @@ function renderOverview() {
 }
 
 /* ================= SVG 图表生成器 ================= */
+// 持久 SVG：首次调用建树，之后只 setAttribute('d')。
+// 原来每次 3 秒 tick 都 innerHTML 换一棵新 svg（4 张图 = 4 次元素替换 + ~2000 次 toFixed）。
+function sparklineInto(el, vals, color, w = 120, h = 30) {
+  if (!el) return;
+  if (!vals || vals.length < 2) { if (el.firstElementChild) el.innerHTML = ''; return; }
+  const max = Math.max(...vals), min = Math.min(...vals);
+  const X = i => i / (vals.length - 1) * w;
+  const Y = v => h - (v - min) / (max - min || 1) * (h - 4) - 2;
+  const d = vals.map((v, i) => `${i ? 'L' : 'M'}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join('');
+  let svg = el.firstElementChild;
+  if (!svg || svg.tagName !== 'svg') {
+    el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">
+      <path class="ar" d="" fill="${color}" opacity=".12"/>
+      <path class="ln" d="" fill="none" stroke="${color}" stroke-width="calc(var(--seed-chart-weight) * .9)" vector-effect="non-scaling-stroke" opacity=".85"/></svg>`;
+    svg = el.firstElementChild;
+  }
+  svg.children[0].setAttribute('d', `${d}L${w},${h}L0,${h}Z`);
+  svg.children[1].setAttribute('d', d);
+}
+// 兼容旧调用点（结构层首屏用）：返回字符串
 function sparkline(vals, color, w = 120, h = 30) {
   if (!vals || vals.length < 2) return '';
   const max = Math.max(...vals), min = Math.min(...vals);
@@ -1705,27 +1995,37 @@ function sparkline(vals, color, w = 120, h = 30) {
   const d = vals.map((v, i) => `${i ? 'L' : 'M'}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join('');
   return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">
     <path d="${d}L${w},${h}L0,${h}Z" fill="${color}" opacity=".12"/>
-    <path d="${d}" fill="none" stroke="${color}" stroke-width="1.4" vector-effect="non-scaling-stroke" opacity=".85"/></svg>`;
+    <path d="${d}" fill="none" stroke="${color}" stroke-width="calc(var(--seed-chart-weight) * .9)" vector-effect="non-scaling-stroke" opacity=".85"/></svg>`;
 }
 function rateChartInto(box) {
   if (!box) return;
   const buf = ovWindow(600);                    // 1.3 按时间窗（近 10 分钟）取，不按点数切
-  if (buf.length < 2) { box.innerHTML = '<div class="hint" style="padding:16px">速率采样中…（每 3 秒拉一次；单点间隔由 daed 采样密度决定）</div>'; return; }
+  if (buf.length < 2) { box.innerHTML = '<div class="empty">速率采样中…（每 3 秒拉一次；单点间隔由 daed 采样密度决定）</div>'; return; }
   const W = 600, H = 168, pad = 6;
   const maxV = Math.max(1, ...buf.map(s => Math.max(s.up, s.down))) * 1.15;
   const X = i => pad + i / (buf.length - 1) * (W - pad * 2);
   const Y = v => H - pad - v / maxV * (H - pad * 2);
   const path = key => buf.map((s, i) => `${i ? 'L' : 'M'}${X(i).toFixed(1)},${Y(s[key]).toFixed(1)}`).join('');
   const area = key => `${path(key)}L${X(buf.length - 1).toFixed(1)},${H - pad}L${X(0).toFixed(1)},${H - pad}Z`;
-  const grid = [0.25, 0.5, 0.75].map(f => `<line x1="0" x2="${W}" y1="${(H * f) | 0}" y2="${(H * f) | 0}" stroke="var(--border)" stroke-width="1"/>`).join('');
-  const yLab = [0, 0.5, 1].map(f => `<text x="${pad}" y="${(H - pad - f * (H - pad * 2)) - 3}" font-size="9" fill="var(--text-3)" font-family="var(--mono)">${fmtRate(maxV * f)}</text>`).join('');
-  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="近 10 分钟下载与上传速率">
-    ${grid}${yLab}
-    <path d="${area('down')}" fill="var(--primary)" opacity=".10"/>
-    <path d="${path('down')}" fill="none" stroke="var(--primary)" stroke-width="var(--seed-chart-weight)" vector-effect="non-scaling-stroke"/>
-    <path d="${area('up')}" fill="var(--success)" opacity=".08"/>
-    <path d="${path('up')}" fill="none" stroke="var(--success)" stroke-width="calc(var(--seed-chart-weight) * .85)" vector-effect="non-scaling-stroke"/>
-  </svg>`;
+  // 网格与 Y 轴刻度只在"刻度标签文字"变化时重建；数据 path 每次只改 d
+  const labKey = [0, 0.5, 1].map(f => fmtRate(maxV * f)).join('|');
+  let svg = box.firstElementChild;
+  if (!svg || svg.tagName !== 'svg' || svg.dataset.lab !== labKey) {
+    const grid = [0.25, 0.5, 0.75].map(f => `<line x1="0" x2="${W}" y1="${(H * f) | 0}" y2="${(H * f) | 0}" stroke="var(--border)" stroke-width="1"/>`).join('');
+    const yLab = [0, 0.5, 1].map(f => `<text x="${pad}" y="${(H - pad - f * (H - pad * 2)) - 3}" font-size="9" fill="var(--text-3)" font-family="var(--mono)">${fmtRate(maxV * f)}</text>`).join('');
+    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="近 10 分钟下载与上传速率" data-lab="${esc(labKey)}">
+      <g class="gc">${grid}${yLab}</g>
+      <path class="p-dn-a" d="" fill="var(--primary)" opacity=".10"/>
+      <path class="p-dn" d="" fill="none" stroke="var(--primary)" stroke-width="var(--seed-chart-weight)" vector-effect="non-scaling-stroke"/>
+      <path class="p-up-a" d="" fill="var(--success)" opacity=".08"/>
+      <path class="p-up" d="" fill="none" stroke="var(--success)" stroke-width="calc(var(--seed-chart-weight) * .85)" vector-effect="non-scaling-stroke"/>
+    </svg>`;
+    svg = box.firstElementChild;
+  }
+  svg.querySelector('.p-dn-a').setAttribute('d', area('down'));
+  svg.querySelector('.p-dn').setAttribute('d', path('down'));
+  svg.querySelector('.p-up-a').setAttribute('d', area('up'));
+  svg.querySelector('.p-up').setAttribute('d', path('up'));
 }
 /* ================= 页面：出口记录 ================= */
 function cgiUrl(params) {
@@ -1742,9 +2042,18 @@ async function refreshLog(manual) {
     const p = new URLSearchParams();
     if (manual || !S.logCur.inode) p.set('reset', '1');
     else { p.set('inode', S.logCur.inode); p.set('off', S.logCur.off); }
+    // #MEM/#GUARD 各要 CGI fork 一个进程（awk / tail+sed），而变化很慢：
+    // 按时间判定（至多每 60s 要一次），手动刷新总要。不要按次数——非日志页
+    // 轮询是 10s 一次，数 20 次要 200 秒，内存 KPI 会空很久。
+    if (manual || !S._logMetaAt || Date.now() - S._logMetaAt > 60000) { p.set('meta', '1'); S._logMetaAt = Date.now(); }
+    else p.set('meta', '0');
     const r = await fetchTimeout(cgiUrl(p), {}, 10000);
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    let text = await r.text();
+    // 按字节算游标：r.text() 会把非法 UTF-8 替换成 U+FFFD，再 TextEncoder 量回去
+    // 长度就对不上（游标漂移 → 重复/丢行）。所以直接拿 ArrayBuffer，只对要显示
+    // 的片段 decode。控制段（#MEM/#GUARD/#META）全是 ASCII，字符偏移即字节偏移。
+    const buf = new Uint8Array(await r.arrayBuffer());
+    let text = new TextDecoder().decode(buf);
     const mem = /^#MEM\s+(\d+)/m.exec(text);
     if (mem) { S.memAvailKB = +mem[1]; memHistSample(); }
     // 守卫事件 → 通知中心（去重后推送）
@@ -1753,23 +2062,28 @@ async function refreshLog(manual) {
       const known = new Set(S.guardLog || []);
       S.guardLog = gLines;
     }
-    text = text.replace(/^#GUARD .*$/mg, '');
     // #META：本次切片的起点与"是否回填"；据此推进游标
     const meta = /^#META inode=(\d+) size=(\d+) off=(\d+) reset=(\d)/m.exec(text);
     if (meta) {
       // 从 #META 那一行的换行之后开始算日志体（CGI 保证 #META 是控制段的最后一行）。
       // 注意不要用 replace(/^#META .*$/mg,'')：那样会留下该行的换行符，
       // 被算进游标就会让偏移多 1 字节 → 下一批的第一行被截断丢掉。
-      text = text.slice(text.indexOf('\n', meta.index) + 1);
+      const bodyStart = text.indexOf('\n', meta.index) + 1;   // 控制段纯 ASCII ⇒ 字符偏移==字节偏移
       // 只消费到最后一个换行：末尾若是不完整的行，就留给下次读（否则会把半行喂给解析器）
-      const nl = text.lastIndexOf('\n');
-      const consumed = nl === -1 ? '' : text.slice(0, nl + 1);
-      // dialer 里带 emoji：JS 的 String.length 是 UTF-16 码元数 ≠ 字节数，必须用 TextEncoder 计字节
-      S.logCur = { inode: +meta[1], off: (+meta[3]) + new TextEncoder().encode(consumed).length };
+      let lastNl = -1;
+      for (let i = buf.length - 1; i >= bodyStart; i--) { if (buf[i] === 0x0A) { lastNl = i; break; } }
+      const end = lastNl === -1 ? bodyStart : lastNl + 1;
+      S.logCur = { inode: +meta[1], off: (+meta[3]) + (end - bodyStart) };
+      text = new TextDecoder().decode(buf.subarray(bodyStart, end));
+    } else {
+      // CGI 回了 200 却没有 #META（部署版本过旧/被劫持）：游标无法推进。
+      // 保持原游标 + 按错误退避，否则会每 3 秒重拉一次 ~108KB 回填；内容仍解析（去重后不重复入表）
+      S.lastErrAt = Date.now();
+      if (!cgiWarned) { toast('日志 CGI 响应缺少 #META 控制行（确认 /www/cgi-bin/daed-board-log 是当前版本）', 'err'); cgiWarned = true; }
     }
     ingestLog(text);
     renderLogPage();
-    if (S.page === 'proxies') renderGroups();      // 实际出口即刻反映
+    if (S.page === 'proxies') updateGroupExits();   // 实际出口即刻反映（只改出口行，不重建整页）
     else if (S.page === 'overview') renderOverview();
   } catch (e) {
     if (manual || !cgiWarned) { toast('日志接口不可用：' + e.message + '（确认路由器已部署 /www/cgi-bin/daed-board-log）', 'err'); cgiWarned = true; }
@@ -1787,7 +2101,7 @@ function pageLogs(el) {
     </div>
     <div class="exit-cards" id="lg-exits"></div>
     <div class="card"><div class="table-wrap" id="lg-table"><div class="empty">加载中…</div></div></div>
-    <p class="hint" style="margin-top:10px">说明：仅代理出站流量会产生连接日志（直连/拦截不记录）；dialer 字段为每条连接真实选点真值。日志级别需 ≥ info。</p>`;
+    <p class="hint" style="margin-top:10px">说明：daed 2026.09.20 起逐连接日志降为 Debug 级，info 级只输出「组选点」记录（Group selects/re-selects dialer），故来源设备/目标/嗅探域名列留空，dialer 仍为真实选点真值。把日志级别调到 debug 可恢复逐连接明细。</p>`;
   $('#lg-search').addEventListener('input', e => { S.logFilter = e.target.value.trim().toLowerCase(); renderLogPage(); });
   $('#lg-ob').addEventListener('change', e => { S.logOb = e.target.value; renderLogPage(); });
   $('#lg-refresh').addEventListener('click', () => refreshLog(true));
@@ -1819,8 +2133,8 @@ function renderLogPage() {
       const rec = recentFor(g);
       if (!rec) return '';
       return `<div class="card exit-card">
-        <span class="dot-now"></span>
-        <div style="min-width:0"><div class="gname">${esc(g.name)} · 最近实际出口</div><div class="node">${esc(rec.name)}</div></div>
+        <span class="dot on"></span>
+        <div style="min-width:0"><div class="gn2">${esc(g.name)} · 最近实际出口</div><div class="nd">${esc(rec.name)}</div></div>
         <span class="ago">${ago(rec.ts)}</span>
       </div>`;
     }).join('');
@@ -1840,7 +2154,7 @@ function renderLogPage() {
   table.innerHTML = `<table class="tbl"><thead><tr>
       <th>时间</th><th>网络</th><th>来源设备</th><th>目标</th><th>嗅探域名</th><th>出站</th><th>节点（实际）</th><th>策略</th><th>进程</th><th>MAC</th>
     </tr></thead><tbody>
-    ${rows.map(e => `<tr data-raw="${esc('[' + new Date(e.ts).toLocaleString() + '] ' + shortSrc(e.src) + ' <-> ' + e.dst + ' ' + kvRebuild(e))}" title="点击复制原始日志行">
+    ${rows.map(e => `<tr data-raw="${esc(e.raw || ('[' + (e._ls || (e._ls = new Date(e.ts).toLocaleString())) + '] ' + shortSrc(e.src) + ' <-> ' + e.dst + ' ' + kvRebuild(e)))}" title="点击复制原始日志行">
       <td class="mono">${hhmm(e.ts)}</td>
       <td>${esc(e.network || '')}</td>
       <td class="mono">${esc(shortSrc(e.src))}</td>
@@ -1965,7 +2279,9 @@ async function subUpdate(s) {
   toast(`正在更新订阅「${s.tag}」…（重新拉取并严格对账）`);
   try {
     const r = await api.updateSub(s.id);
-    toast(`订阅「${r.tag}」已更新，节点数 ${r.nodes ? r.nodes.totalCount : '—'}`, 'ok');
+    // 订阅更新是"删旧建新"：所有节点 id 都会变。托管分组按名称自动补员，
+    // 所以名字别改；换名字会断了补员映射。
+    toast(`订阅「${r.tag}」已更新，节点数 ${r.nodes ? r.nodes.totalCount : '—'}（节点 ID 已重建；托管分组会按名称自动补员，勿改节点名）`, 'ok');
   } catch (e) {
     if (e instanceof AuthError) return handleAuthError();
     toast(`更新失败：${e.message}（严格对账失败时现有节点保持不变）`, 'err');
@@ -2509,6 +2825,7 @@ async function cfgRenderText(kind) {
       </label>
       <button class="btn btn-sm" id="cfg-do-verify">① 校验</button>
       <button class="btn btn-primary btn-sm" id="cfg-do-save">② 保存</button>
+      <button class="btn btn-sm" id="cfg-rollback" title="还原到本次保存前的文本（每次保存前会自动存一份）">↩ 还原到上一个</button>
       <button class="btn btn-danger btn-sm" id="cfg-del">删除此版本</button>
       ${item.selected ? '' : '<button class="btn btn-sm" id="cfg-select">设为当前</button>'}
       <span class="hint" id="cfg-verify"></span>
@@ -2530,6 +2847,22 @@ async function cfgRenderText(kind) {
     } catch (e) { out.innerHTML = `<span class="imp-result bad">✗ ${esc(e.message)}</span>`; }
   });
   q('#cfg-do-save').addEventListener('click', () => cfgSaveText(kind));
+  // 还原到上一个：每次保存前会把旧文本写进 jsonStorage，这里真正写回（原来只有
+  // 全局配置有"还原"且只填表单不提交；路由/DNS 作为命脉更不能没有回退）
+  q('#cfg-rollback').addEventListener('click', async () => {
+    const snap = await cfgTextSnapGet(kind);
+    if (!snap) return toast(`没有「${meta.label}」的历史文本可还原`, 'err');
+    const ok = await showConfirm(`把「${meta.label}」版本「<b>${esc(snap.name || snap.id)}</b>」还原为 <b>${new Date(snap.at).toLocaleString()}</b> 保存前的文本？<br><span class="hint">会覆盖编辑器当前内容并保存（未应用，记得点「应用改动」）。</span>`);
+    if (!ok) return;
+    st.editId = snap.id;
+    q('#cfg-text').value = snap.text;
+    try { await api[meta.update](snap.id, snap.text); toast('已写回旧文本（未应用）', 'ok'); cfgUpdateModified(); cfgRenderText(kind); }
+    catch (e) { toast('写回失败：' + e.message, 'err'); }
+  });
+  cfgTextSnapGet(kind).then(s => {
+    const b = q('#cfg-rollback');
+    if (b && s) b.textContent = `↩ 还原到 ${new Date(s.at).toLocaleString().slice(5, 16)}`;
+  });
   q('#cfg-new').addEventListener('click', async () => {
     const v = await showModal({ title: `新建${meta.label}版本（复制当前文本）`, fields: [{ key: 'name', label: '版本名称', placeholder: '如：备份-20260906' }] });
     if (!v || !(v.name || '').trim()) return;
@@ -2554,6 +2887,13 @@ async function cfgRenderText(kind) {
     try { await api[meta.select](st.editId); toast('已设为当前，记得点「应用改动」', 'ok'); cfgRenderText(kind); cfgUpdateModified(); }
     catch (e) { toast('失败：' + e.message, 'err'); }
   });
+}
+// ---- 路由/DNS 文本快照：每次保存前存旧文本，可一键写回 ----
+function cfgTextSnapKey(kind) { return 'daed-board/cfgsnap-' + kind; }
+function cfgTextSnapGet(kind) {
+  return api.getStorage([cfgTextSnapKey(kind)]).then(vals => {
+    try { return JSON.parse((vals && vals[0]) || 'null'); } catch { return null; }
+  }).catch(() => null);
 }
 async function cfgSaveText(kind) {
   const meta = CFG_TABS[kind];
@@ -2583,6 +2923,8 @@ async function cfgSaveText(kind) {
     if (!v || !v.ack) { vout.innerHTML = '<span class="hint">已取消保存</span>'; return; }
   }
   try {
+    // 保存前把旧文本存进 jsonStorage（路由/DNS 是命脉，改坏了要能一键回退）
+    try { await api.setStorage([cfgTextSnapKey(kind)], [JSON.stringify({ at: Date.now(), id: st.editId, name: item.name, text: oldText })]); } catch {}
     await api[meta.update](st.editId, nw);
     if (kind === 'routing') item.routing = { string: nw }; else item.dns = { string: nw };
     toast(`「${meta.label}」已保存（未应用）——记得点「应用改动」`, 'ok');
@@ -2651,9 +2993,18 @@ async function cfgRenderGlobal() {
   q('#cfg-gsnap').addEventListener('click', async () => {
     const snap = await cfgSnapGet();
     if (!snap) return toast('没有可用快照', 'err');
-    S.cfgGlobal.obj = snap.global;
-    cfgRenderGlobal();
-    toast('已从快照回填表单，检查后点「保存」', 'ok');
+    const ok = await showConfirm(`把全局配置还原为 <b>${new Date(snap.at).toLocaleString()}</b> 保存前的值？<br><span class="hint">会直接写回并保存（未应用，记得点「应用改动」）。</span>`);
+    if (!ok) return;
+    try {
+      await api.updateConfig(snap.id || S.cfgGlobal.id, snap.global);
+      S.cfgGlobal.obj = snap.global;
+      cfgRenderGlobal();
+      toast('已写回快照（未应用）——记得点「应用改动」', 'ok');
+      cfgUpdateModified();
+    } catch (e) {
+      if (e instanceof AuthError) return handleAuthError();
+      toast('写回失败：' + e.message, 'err');
+    }
   });
   cfgSnapGet().then(snap => {
     const btn = q('#cfg-gsnap');
@@ -2745,13 +3096,19 @@ function updateNavState() {
   if (link && S.cfg.backend) link.href = S.cfg.backend.replace(/\/+$/, '');
   const av = $('#about-version');
   if (av && g) av.textContent = 'dae ' + (g.dae.version || '') + (g.dae.modified ? ' · 有改动未应用' : '');
-  renderNav();
-  topChips();
+  // renderNav/topChips 会重建 12 个带 SVG 的导航项，每 3 秒一次纯属浪费；
+  // 只有页面/计数/运行态/日志级别真变了才重建。
+  const navKey = [S.page, navCounts('proxies'), navCounts('nodes'),
+    g ? (g.dae.running ? 1 : 0) : -1, g && g.dae.modified ? 1 : 0, (S.cfg.logLevel || '')].join('|');
+  if (navKey !== S._navKey) { S._navKey = navKey; renderNav(); topChips(); }
 }
 
 /* ================= 轮询 ================= */
 const POLL = [
-  { key: 'groups', period: () => S.cfg.groupSec * 1000, pages: null, skipOn: ['overview'], run: () => refreshGroups(false) },
+  // 注意：key 不能与 refreshGroups 内部的 S.inflight guard 同名（曾叫 'groups'，
+  // 导致 tick 先 add 再 run、refreshGroups 每次都在 guard 上直接 return，
+  // 30 秒组轮询从未触发过——代理页数据与 steerAudit 全停摆）。
+  { key: 'poll:groups', period: () => S.cfg.groupSec * 1000, pages: null, skipOn: ['overview'], run: () => refreshGroups(false) },
   { key: 'poll:general', period: () => 3000, pages: ['overview'], run: () => refreshGeneral() },
   { key: 'poll:log', period: () => S.cfg.logSec * 1000, pages: ['logs'], run: () => refreshLog(false) },
   { key: 'poll:logbg', period: () => Math.max(S.cfg.logSec, 10) * 1000, pages: null, run: () => { if (S.page !== 'logs') return refreshLog(false); } },
@@ -2765,25 +3122,34 @@ const POLL = [
     try { await checkSteerHealth(); } catch {}
   } },
   // 面板侧主动重测组池：daed 内核 checkInterval 默认约 3m，这里可更密（默认 90s；0=关闭）
-  { key: 'poll:retest', period: () => (S.cfg.retestSec > 0 ? S.cfg.retestSec * 1000 : Infinity), pages: null, run: async () => {
-    if (!(S.cfg.retestSec > 0) || S.testing.size) return;
+  // 只在代理/节点页跑：配置页、设置页、后台标签页跑它纯属白烧路由器 CPU
+  { key: 'poll:retest', period: () => (S.cfg.retestSec > 0 ? S.cfg.retestSec * 1000 : Infinity), pages: ['proxies', 'nodes'], run: async () => {
+    if (!(S.cfg.retestSec > 0) || S.testing.size || document.hidden) return;
     const ids = [...new Set(S.groups.flatMap(g => (g.pool || g.nodes || []).map(n => n.id)))];
     if (ids.length) await testNodes(ids);
   } },
 ];
 setInterval(() => {
-  if (!S.authed || $('#app').hidden) return;
+  if (!S.authed || $('#app').hidden || document.hidden) return;   // 后台标签页不轮询（LuCI iframe 里也算）
   const now = Date.now();
   for (const p of POLL) {
     if (p.pages && !p.pages.includes(S.page)) continue;
     if (p.skipOn && p.skipOn.includes(S.page)) continue; // 1.10 概览页的 groups 由概览批量查询承载
     if (now - (S.lastTs[p.key] || 0) < p.period()) continue;
     if (S.inflight.has(p.key)) continue;
+    // 后端在报错（daed run 要 7-23s，或后端不可达）时整体退避到 3 倍周期，
+    // 避免每 3 秒重试还把 banner 重写一遍
+    const backing = S.lastErrAt && (now - S.lastErrAt < 20000);
+    if (now - (S.lastTs[p.key] || 0) < p.period() * (backing ? 3 : 1)) continue;
     S.lastTs[p.key] = now;
     S.inflight.add(p.key);
     Promise.resolve(p.run()).catch(() => {}).finally(() => S.inflight.delete(p.key));
   }
 }, 1000);
+// 从后台切回前台：立刻追平一次，而不是等各自的周期耗尽
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && S.authed) S.lastTs = {};
+});
 
 /* ================= 启动 ================= */
 async function boot() {
