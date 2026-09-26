@@ -15,6 +15,7 @@ import argparse
 import getpass
 import http.server
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -73,12 +74,16 @@ def main():
         if not (HERE / f).exists():
             sys.exit(f"缺少 {f}")
 
-    # 防缓存：上传前给 index.html 的静态引用打上时间戳版本号
+    # 防缓存：上传前给 index.html 的静态引用打上时间戳版本号。
+    # 必须走正则：引用可能已带手工 ?v=（匹配不到就静默失效，app.js 会永远拿旧缓存）。
     stamp = str(int(time.time()))
     upload_dir = HERE / "_deploy"
     upload_dir.mkdir(exist_ok=True)
     html = (HERE / "index.html").read_text(encoding="utf-8")
-    html = html.replace('style.css"', f'style.css?v={stamp}"').replace('app.js"', f'app.js?v={stamp}"')
+    html = re.sub(r'(app\.js)(\?v=[^"]*)?(")', rf'\1?v={stamp}\3', html)
+    html = re.sub(r'(style\.css)(\?v=[^"]*)?(")', rf'\1?v={stamp}\3', html)
+    if f'app.js?v={stamp}' not in html or f'style.css?v={stamp}' not in html:
+        sys.exit("缓存戳写入失败：index.html 引用格式变了，请检查 deploy.py 的打戳正则")
     (upload_dir / "index.html").write_text(html, encoding="utf-8")
     for f in ("app.js", "style.css"):
         (upload_dir / f).write_bytes((HERE / f).read_bytes())
